@@ -2161,49 +2161,437 @@ async def edit_scope_handler(update, context):
 # 📨 11. JOB EXECUTION
 # ==============================================================================
 
+def _format_time_12h(time_str):
+    """Convert 'HH:MM' (24h) to a readable '3:41 PM'."""
+    try:
+        h, m = str(time_str).strip().split(":")[:2]
+        h, m = int(h), int(m[:2])
+        suffix = "AM" if h < 12 else "PM"
+        h12 = h % 12 or 12
+        return f"{h12}:{m:02d} {suffix}"
+    except Exception:
+        return str(time_str)
+
+
+def _split_subject(subject):
+    """
+    Split 'CDA/ACS 205 : Machine Learning Techniques' into
+    ('CDA/ACS 205', 'Machine Learning Techniques').
+
+    Visual hierarchy is the single biggest driver of "wow" — a big bold
+    subject name with a small course code above it reads like a designed
+    poster. One long undifferentiated line reads like a database dump.
+    """
+    s = str(subject or "Class").strip()
+    for sep in (":", "-", "—", "|"):
+        if sep in s:
+            left, right = s.split(sep, 1)
+            left, right = left.strip(), right.strip()
+            # Course code is the short side that contains a digit
+            if left and right and len(left) <= 18 and any(c.isdigit() for c in left):
+                return left, right
+            break
+    return "", s
+
+
+def _minutes_until(time_str, now):
+    """Minutes from `now` until today's HH:MM. None if unparseable."""
+    try:
+        h, m = str(time_str).strip().split(":")[:2]
+        target = now.replace(hour=int(h), minute=int(m[:2]), second=0, microsecond=0)
+        return int(round((target - now).total_seconds() / 60.0))
+    except Exception:
+        return None
+
+
 def _generate_class_notification(batch, subject, time_str, link=None):
     """
-    Clean, professional class notification template.
-    Minimal emojis, clear spacing, and an administrative tone.
+    Premium class notification generator.
+
+    ── Why this looks good (design rationale) ──────────────────────────
+    Telegram renders messages in a PROPORTIONAL font. That single fact
+    drives every decision here:
+
+      1. ASCII boxes (┌──┐ / ╔══╗) can never align — the right edge goes
+         ragged and looks broken. They are gone. Alignment is achieved
+         with <pre>, the only element Telegram renders in true monospace.
+      2. <blockquote> is a native Telegram UI element (indent + left bar).
+         It costs zero characters and looks designed. Used as the accent.
+      3. Hierarchy beats decoration. Big bold NAME, small course code,
+         then data. The eye lands in the right place instantly.
+      4. Whitespace is what makes layout look expensive. Emoji density is
+         what makes it look like spam. So: generous spacing, few emoji.
+      5. Urgency drives engagement more than ornament. A live countdown
+         ("starts in 10 minutes") is the actual hook.
+
+    ── Variety ─────────────────────────────────────────────────────────
+    4 design systems × 3 title treatments × 12 headers × 10 openers
+    × 12 flavours/subject × 10 CTAs × 8 link styles, all tracked by
+    per-category deques → no repeat for weeks of daily classes.
     """
     import random
-    
+    from collections import deque
+
+    # ─── ANTI-REPETITION ───
+    if not hasattr(_generate_class_notification, '_history'):
+        _generate_class_notification._history = {
+            'design': deque(maxlen=3),
+            'title': deque(maxlen=2),
+            'rule': deque(maxlen=8),
+            'opener': deque(maxlen=12),
+            'flavour': deque(maxlen=12),
+            'cta': deque(maxlen=8),
+            'link': deque(maxlen=6),
+            'urgency': deque(maxlen=5),
+        }
+    history = _generate_class_notification._history
+
+    def pick(pool, cat):
+        avail = [x for x in pool if x not in history[cat]]
+        if not avail:
+            history[cat].clear()
+            avail = pool
+        c = random.choice(avail)
+        history[cat].append(c)
+        return c
+
     now = datetime.now(IST)
-    date_str = now.strftime('%A, %d %B %Y')
-    
-    # ── Subject Formatting ──
-    # Clean subject name, removing generic emojis
-    subject_clean = subject.strip()
-    
-    # ── Batch Formatting ──
-    batch_clean = batch.strip()
-    
-    # ── Greeting ──
-    greetings = [
-        f"<b>📢 ATTENTION {batch_clean} STUDENTS</b>",
-        f"<b>📢 CLASS ANNOUNCEMENT: {batch_clean}</b>",
-        f"<b>📢 SCHEDULED SESSION: {batch_clean}</b>"
+    day_name = now.strftime('%A')
+    day_short = now.strftime('%a')
+    date_full = now.strftime('%d %B %Y')
+    date_short = now.strftime('%d %b')
+    time_12h = _format_time_12h(time_str)
+    hour = now.hour
+
+    code, name = _split_subject(subject)
+    code_e = html.escape(code)
+    name_e = html.escape(name)
+    batch_e = html.escape(str(batch or "—"))
+    sub_lower = str(subject or "").lower()
+
+    # ─── SUBJECT IDENTITY (icon + accent) ───
+    sub_icon, accent = "📘", "◆"
+    identity = [
+        (("statistic", "cda 201", "cda/acs 201"), "📊", "◆"),
+        (("algorithm", "203"),                    "🧩", "◈"),
+        (("machine", "learning", "205"),          "🤖", "◆"),
+        (("financial", "economic", "207"),        "💹", "◇"),
+        (("cyber", "security", "foundation"),     "🛡", "◈"),
     ]
-    greeting = random.choice(greetings)
-    
-    # ── Link Section ──
-    link_section = ""
-    if link:
-        link_section = f"\n<a href='{link}'><b>🔗 Click here to join the class</b></a>\n"
-    
-    # ── Message Composition ──
-    msg = (
-        f"{greeting}\n\n"
-        f"<strong>🗓️ {date_str}</strong>\n\n"
-        f"<blockquote>\n"
-        f"<b>⏰ {time_str}</b>\n"
-        f"<strong>📘 {subject_clean}</strong>\n"
-        f"</blockquote>\n\n"
-        f"<i>💻 Mode:</i> <strong>Online Session</strong>\n"
-        f"{link_section}"
-    )
-    
-    return msg
+    for keys, ic, ac in identity:
+        if any(k in sub_lower for k in keys):
+            sub_icon, accent = ic, ac
+            break
+
+    # ─── LIVE URGENCY (the real engagement hook) ───
+    mins = _minutes_until(time_str, now)
+    urgency = ""
+    if mins is not None:
+        if mins <= 0:
+            urgency = pick([
+                "🔴  <b>LIVE NOW</b>",
+                "🔴  <b>Starting right now</b>",
+                "🔴  <b>Class is live</b>",
+            ], 'urgency')
+        elif mins <= 2:
+            urgency = f"🔴  <b>Starting now</b>"
+        elif mins <= 20:
+            urgency = pick([
+                f"⏳  Starts in <b>{mins} minutes</b>",
+                f"⏳  <b>{mins} minutes</b> to go",
+                f"⏳  Live in <b>{mins} minutes</b>",
+                f"⏳  <b>T-{mins} min</b>",
+                f"⏳  Doors open in <b>{mins} min</b>",
+            ], 'urgency')
+        elif mins <= 90:
+            urgency = f"⏳  Starts in <b>{mins} minutes</b>"
+        # Beyond 90 min a countdown adds nothing the data block doesn't
+        # already say, so leave it off rather than duplicate the time.
+
+    # ─── HORIZONTAL RULES (full-width, nothing to align against) ───
+    rules = [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "──────────────────────",
+        "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
+        "═══════════════════════",
+        "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯",
+        "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔",
+        "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈",
+        "･･･････････････････････",
+        f"{accent}━━━━━━━━━━━━━━━━━━━━{accent}",
+        f"{accent} ─────────────────── {accent}",
+    ]
+    rule = pick(rules, 'rule')
+
+    # ─── TIME-AWARE OPENERS ───
+    if hour < 12:
+        openers = [
+            "Good morning.", "Morning, everyone.", f"Happy {day_name}.",
+            "Rise and shine.", "Morning roll call.", "New day, new session.",
+            "Coffee first, then class.", "Early start today.",
+            f"{day_name} morning.", "Let's begin.",
+        ]
+    elif hour < 17:
+        openers = [
+            "Afternoon session.", "Good afternoon.", "Post-lunch session.",
+            f"{day_name} afternoon.", "Midday session.", "Back to it.",
+            "Afternoon roll call.", "Next up.", "Half the day left.",
+            "Let's keep going.",
+        ]
+    else:
+        openers = [
+            "Evening session.", "Good evening.", "Last one for today.",
+            f"{day_name} evening.", "Evening roll call.", "Winding down.",
+            "One more to go.", "Finishing strong.", "Late session.",
+            "Evening slot.",
+        ]
+    opener = pick(openers, 'opener')
+
+    # ─── SUBJECT-AWARE FLAVOUR ───
+    if any(k in sub_lower for k in ("statistic", "cda 201", "cda/acs 201")):
+        flavours = [
+            "Probability isn't going to learn itself.",
+            "Distributions, variance, the good stuff.",
+            "Numbers tell stories. Let's read them.",
+            "Bayes would want you to show up.",
+            "Correlation is not causation. Let's discuss.",
+            "Standard deviation waits for no one.",
+            "Time to make the data make sense.",
+            "Hypothesis testing today.",
+            "Mean, median, mode. The holy trinity.",
+            "p &lt; 0.05. Attendance is significant.",
+            "Confidence intervals are calling.",
+            "Sampling the good knowledge today.",
+        ]
+    elif any(k in sub_lower for k in ("algorithm", "203")):
+        flavours = [
+            "Sorting out complexity. Literally.",
+            "Big-O notation enters the chat.",
+            "Greedy or dynamic? Find out today.",
+            "Graphs, trees, paths. Pick your weapon.",
+            "Divide and conquer.",
+            "Pseudocode time. Bring your brain.",
+            "Optimal solutions don't find themselves.",
+            "Algorithmic thinking: enabled.",
+            "Time complexity won't optimise itself.",
+            "BFS your way to class.",
+            "No shortcut has better complexity than showing up.",
+            "Today's problem set won't solve itself.",
+        ]
+    elif any(k in sub_lower for k in ("machine", "learning", "205")):
+        flavours = [
+            "Models don't train themselves.",
+            "Gradient descent, incoming.",
+            "Features, labels, accuracy. The usual trio.",
+            "Let's teach machines something.",
+            "Overfitting? Not today.",
+            "Neural connections start with attendance.",
+            "Supervised or unsupervised. One way to find out.",
+            "The loss from missing class is high.",
+            "Your learning rate depends on this.",
+            "Epoch one of today's session.",
+            "Bias-variance tradeoff: skip vs attend.",
+            "Training data: your notes.",
+        ]
+    elif any(k in sub_lower for k in ("financial", "economic", "207")):
+        flavours = [
+            "Markets move. So should we.",
+            "Risk, return, and real talk.",
+            "More than GDP and inflation.",
+            "Time value of money, and of your time.",
+            "Portfolio theory hits different live.",
+            "Supply, demand, and your attendance.",
+            "Compound interest on knowledge starts now.",
+            "Bull or bear, class is always on.",
+            "Attendance: a blue-chip investment.",
+            "Opportunity cost of skipping is high.",
+            "Diversify your skills.",
+            "Today's yield: knowledge.",
+        ]
+    elif any(k in sub_lower for k in ("cyber", "security", "foundation")):
+        flavours = [
+            "Firewalls won't cover a missed class.",
+            "Encryption starts with understanding.",
+            "Threats are real. So is this session.",
+            "The CIA triad. Not that agency.",
+            "Defence in depth starts here.",
+            "Patch your knowledge gaps.",
+            "Social engineering won't fool the attendance bot.",
+            "Zero-day on ignorance. Fix it now.",
+            "Authentication required: your presence.",
+            "Access granted to those who show up.",
+            "Brute force won't crack this syllabus.",
+            "Your knowledge base needs an update.",
+        ]
+    else:
+        flavours = [
+            "One step closer to the goal.",
+            "Today's effort, tomorrow's edge.",
+            "Show up, take notes, thank yourself later.",
+            "Small consistency, big results.",
+            "Your future self is watching.",
+            "Another session, another win.",
+            "The syllabus waits for no one.",
+            "Knowledge compounds.",
+            "Worth the twenty minutes.",
+            "Let's get into it.",
+            "Notes ready?",
+            "This one matters.",
+        ]
+    flavour = pick(flavours, 'flavour')
+
+    # ─── LINK ───
+    link_line = ""
+    has_link = link and str(link).strip().lower() not in ("none", "check group", "")
+    if has_link:
+        href = html.escape(str(link), quote=True)
+        link_line = pick([
+            f"▶️  <a href=\"{href}\"><b>JOIN CLASS</b></a>",
+            f"🔗  <a href=\"{href}\"><b>Join the class</b></a>",
+            f"⚡  <a href=\"{href}\"><b>Join now</b></a>",
+            f"🎯  <a href=\"{href}\"><b>Enter class</b></a>",
+            f"▶️  <a href=\"{href}\"><b>Open session</b></a>",
+            f"🔗  <a href=\"{href}\"><b>Tap to join</b></a>",
+            f"🚀  <a href=\"{href}\"><b>Launch class</b></a>",
+            f"↗️  <a href=\"{href}\"><b>Go to class</b></a>",
+        ], 'link')
+    elif str(link).strip().lower() == "check group":
+        link_line = "🔗  <i>Link will be shared in the group.</i>"
+
+    # ─── CTA ───
+    cta = pick([
+        "👇  Mark your attendance",
+        "👇  Tap below to check in",
+        "👇  Confirm you're here",
+        "👇  One tap to mark present",
+        "👇  Attendance below",
+        "👇  Check in below",
+        "👇  Register your attendance",
+        "👇  Let us know you're in",
+        "👇  Sign in below",
+        "👇  Mark yourself present",
+    ], 'cta')
+
+    # ─── TITLE TREATMENTS (visual hierarchy) ───
+    def title_hero():
+        """Icon + big name, course code underneath. Maximum impact."""
+        out = f"{sub_icon}  <b>{name_e.upper()}</b>"
+        if code_e:
+            out += f"\n<i>{code_e}</i>"
+        return out
+
+    def title_stacked():
+        """Course code first as a label, then the name."""
+        out = ""
+        if code_e:
+            out += f"<code>{code_e}</code>\n"
+        out += f"{sub_icon}  <b>{name_e}</b>"
+        return out
+
+    def title_inline():
+        """Single strong line."""
+        label = f"{code_e} · {name_e}" if code_e else name_e
+        return f"{sub_icon}  <b>{label}</b>"
+
+    title = pick([title_hero, title_stacked, title_inline], 'title')
+
+    # ─── ALIGNED DATA BLOCK ───
+    # <pre> is the ONLY Telegram element rendered in a monospace font, so it
+    # is the only way to get columns that actually line up on every device.
+    # Keep lines short — <pre> does not wrap on some clients.
+    def data_pre():
+        return (
+            "<pre>"
+            f"Time    {time_12h}\n"
+            f"Date    {day_short}, {date_short}\n"
+            f"Batch   {batch_e}"
+            "</pre>"
+        )
+
+    def data_quote():
+        return (
+            "<blockquote>"
+            f"🕒  <b>{time_12h}</b>\n"
+            f"📅  {day_name}, {date_full}\n"
+            f"🎓  {batch_e}"
+            "</blockquote>"
+        )
+
+    def data_inline():
+        return (
+            f"🕒  <b>{time_12h}</b>   📅  {day_short}, {date_short}\n"
+            f"🎓  {batch_e}"
+        )
+
+    def data_rows():
+        return (
+            f"<b>Time</b>    ·  {time_12h}\n"
+            f"<b>Date</b>    ·  {day_name}, {date_short}\n"
+            f"<b>Batch</b>   ·  {batch_e}"
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    #  DESIGN SYSTEMS — four genuinely different visual identities
+    # ══════════════════════════════════════════════════════════════════
+
+    def design_hero():
+        """
+        Poster style. Rule, big title, countdown, aligned monospace card,
+        bold CTA link. The most striking of the four.
+        """
+        parts = [rule, "", title()]
+        if urgency:
+            parts += ["", urgency]
+        parts += ["", data_pre()]
+        if link_line:
+            parts += ["", link_line]
+        parts += ["", f"<i>{flavour}</i>", rule, "", cta]
+        return "\n".join(parts)
+
+    def design_editorial():
+        """
+        Magazine style. Small opener, title, native blockquote for data,
+        flavour as a pull quote. Airy and premium.
+        """
+        parts = [f"<i>{opener}</i>", "", title()]
+        if urgency:
+            parts += ["", urgency]
+        parts += ["", data_quote()]
+        if link_line:
+            parts += ["", link_line]
+        parts += ["", f"<i>{flavour}</i>", "", cta]
+        return "\n".join(parts)
+
+    def design_ticker():
+        """
+        Alert style. Countdown leads, tight data, urgent feel.
+        Shortest of the four — scannable in one glance.
+        """
+        parts = []
+        if urgency:
+            parts += [urgency, ""]
+        parts += [title(), "", data_inline()]
+        if link_line:
+            parts += ["", link_line]
+        parts += ["", f"<i>{flavour}</i>", "", cta]
+        return "\n".join(parts)
+
+    def design_brief():
+        """
+        Structured brief. Rule-separated sections, labelled rows.
+        Reads like a well-formatted document.
+        """
+        parts = [title(), rule, ""]
+        if urgency:
+            parts += [urgency, ""]
+        parts += [data_rows()]
+        if link_line:
+            parts += ["", link_line]
+        parts += ["", f"<blockquote>{flavour}</blockquote>", "", cta]
+        return "\n".join(parts)
+
+    design = pick([design_hero, design_editorial, design_ticker, design_brief], 'design')
+    return design()
 
 
 
@@ -2239,8 +2627,8 @@ async def send_alert_job(context: ContextTypes.DEFAULT_TYPE):
         # Sanitize any forbidden HTML tags
         text = sanitize_html(text)
         
-        msg = f"{text}\n\n👇 <i>Mark attendance:</i>"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ I'm Present", callback_data=f"att_{job.name}")]])
+        msg = text
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Mark me present", callback_data=f"att_{job.name}")]])
         
         sent = False
         
