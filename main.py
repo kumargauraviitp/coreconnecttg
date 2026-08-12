@@ -408,11 +408,12 @@ def cleanup_old_data(context=None):
     SELECT_TOPIC, ADD_TOPIC_NAME, ADD_TOPIC_ID, REMOVE_TOPIC_INPUT,
     EDIT_SUB_SELECT_BATCH, EDIT_SUB_SELECT_SUBJECT, EDIT_SUB_ACTION, EDIT_SUB_NEW_NAME,
     RESET_CONFIRM, EDIT_TOPIC_SELECT, EDIT_TOPIC_NEW_NAME, DELETE_TOPIC_CONFIRM,
-    EDIT_SELECT_SCOPE, EDIT_BULK_DAYS
-) = range(40)
+    EDIT_SELECT_SCOPE, EDIT_BULK_DAYS,
+    COMBINED_SELECT_SUB
+) = range(41)
 
 # Regex to match any menu button for canceling wizards
-MENU_REGEX = "^(📸 AI Auto-Schedule|🧠 Custom AI|🟦 Schedule CSDA|🟧 Schedule AICS|📝 Custom Message|➕ Add Subject|📂 More Options|✏️ Edit Class|🗑️ Delete Class|📅 View Schedule|📊 Attendance|📚 All Subjects|📤 Export Data|📥 Import Data|👥 Manage Admins|💬 Manage Topics|🛠️ Admin Tools|🔙 Back to Main|🌙 Night Schedule|☁️ Force Save|🔄 Reset System|🗑️ Remove Topic|➕ Add Topic Manual|📋 List Topics|👤 Add Admin|🗑️ Remove Admin|📋 View Admins)$"
+MENU_REGEX = "^(📸 AI Auto-Schedule|🧠 Custom AI|🟦 Schedule CSDA|🟧 Schedule AICS|📅 Schedule Classes|📝 Custom Message|➕ Add Subject|📂 More Options|✏️ Edit Class|🗑️ Delete Class|📅 View Schedule|📊 Attendance|📚 All Subjects|📤 Export Data|📥 Import Data|👥 Manage Admins|💬 Manage Topics|🛠️ Admin Tools|🔙 Back to Main|🌙 Night Schedule|☁️ Force Save|🔄 Reset System|🗑️ Remove Topic|➕ Add Topic Manual|📋 List Topics|👤 Add Admin|🗑️ Remove Admin|📋 View Admins)$"
 
 # ==============================================================================
 # 🛠️ UTILITY FUNCTIONS
@@ -648,6 +649,7 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup([
         [KeyboardButton("📸 AI Auto-Schedule"), KeyboardButton("🧠 Custom AI")],
         [KeyboardButton("🟦 Schedule CSDA"), KeyboardButton("🟧 Schedule AICS")],
+        [KeyboardButton("📅 Schedule Classes")],
         [KeyboardButton("📝 Custom Message"), KeyboardButton("➕ Add Subject")],
         [KeyboardButton("📂 More Options ⤵️")]
     ], resize_keyboard=True, is_persistent=True)
@@ -1634,6 +1636,142 @@ async def wizard_finalize(update_obj, context):
     if isinstance(update_obj, Update): await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
     else: await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
     return ConversationHandler.END
+
+# ==============================================================================
+# 📅 9B. COMBINED SCHEDULE WIZARD (Both CSDA & AICS)
+# ==============================================================================
+async def init_combined_schedule_wizard(update, context):
+    """Schedule a class for BOTH CSDA and AICS simultaneously"""
+    if not await require_private_admin(update, context): return ConversationHandler.END
+    if not DB["config"]["group_id"]:
+        await update.message.reply_text(
+            "⛔ <b>NO GROUP LINKED!</b>\n\n"
+            "<i>Add me to a group first, then use /start there.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return ConversationHandler.END
+    
+    context.user_data['sch_batch'] = 'BOTH'  # Mark as combined
+    context.user_data['sch_days'] = []
+    
+    # Combine subjects from both batches (union, no duplicates)
+    csda_subs = DB["subjects"].get("CSDA", [])
+    aics_subs = DB["subjects"].get("AICS", [])
+    all_subs = list(dict.fromkeys(csda_subs + aics_subs))  # Preserve order, remove dupes
+    
+    if not all_subs:
+        await update.message.reply_text(
+            "⚠️ <b>NO SUBJECTS FOUND!</b>\n\n"
+            "<i>Use</i> ➕ <b>Add Subject</b> <i>to add subjects to CSDA or AICS first.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return ConversationHandler.END
+    
+    rows = [[InlineKeyboardButton(f"📖 {s}", callback_data=f"cpick_{s}")] for s in all_subs]
+    await update.message.reply_text(
+        "📅 <b>SCHEDULE FOR BOTH BATCHES</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🎯 <i>Batch:</i> <b>CSDA + AICS</b>\n\n"
+        "<i>Select a subject below:</i> 👇\n"
+        "<i>(Will be scheduled for both batches)</i>",
+        reply_markup=InlineKeyboardMarkup(rows),
+        parse_mode=ParseMode.HTML
+    )
+    return COMBINED_SELECT_SUB
+
+async def combined_pick_sub(update, context):
+    """Handle subject selection for combined schedule"""
+    context.user_data['sch_sub'] = update.callback_query.data.replace("cpick_", "")
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text(
+        "📅 <b>SELECT DAYS</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<i>Tap to toggle days, then hit</i> <b>DONE</b> 🚀",
+        reply_markup=days_keyboard([]),
+        parse_mode=ParseMode.HTML
+    )
+    return SELECT_DAYS
+
+async def combined_wizard_finalize(update_obj, context):
+    """Finalize scheduling for BOTH CSDA and AICS batches"""
+    d = context.user_data
+    sub, days = d['sch_sub'], d['sch_days']
+    start_dt, end_dt = d['start_dt'], d['end_dt']
+    t_str = d['sch_time']
+    try: h, m = map(int, t_str.split(':'))
+    except: return ConversationHandler.END
+
+    day_map = {"Mon":0, "Tue":1, "Wed":2, "Thu":3, "Fri":4, "Sat":5, "Sun":6}
+    target_weekdays = [day_map[day] for day in days]
+    dates = []
+    
+    if end_dt:
+        curr = start_dt
+        while curr <= end_dt:
+            if curr.weekday() in target_weekdays: dates.append(curr)
+            curr += timedelta(days=1)
+    else:
+        for wd in target_weekdays:
+            curr = start_dt
+            delta = wd - curr.weekday()
+            if delta < 0: delta += 7
+            dates.append(curr + timedelta(days=delta))
+
+    count = 0
+    gid = DB["config"]["group_id"]
+    if not gid: return ConversationHandler.END
+
+    # Schedule for BOTH batches
+    for batch in ["CSDA", "AICS"]:
+        for dt in dates:
+            run_dt = dt.replace(hour=h, minute=m, second=0)
+            notify_dt = run_dt - timedelta(minutes=d['sch_offset'])
+            job_id = f"{batch}_{int(time.time())}_{count}"
+            job_data = {
+                "batch": batch, "subject": sub, "time_display": t_str, 
+                "link": d['sch_link'], "manual_msg": d.get('sch_manual_msg'),
+                "msg_type": "MANUAL" if d.get('sch_manual_msg') else "AI",
+                "message_thread_id": d.get('sch_topic_id')
+            }
+            context.job_queue.run_once(send_alert_job, notify_dt, chat_id=gid, name=job_id, data=job_data)
+            add_job_to_db(job_id, notify_dt.timestamp(), gid, job_data)
+            count += 1
+    
+    topic_name = DB.get("topics", {}).get(str(d.get('sch_topic_id')), "General") if d.get('sch_topic_id') else "General"
+    
+    msg = (
+        f"🎉 <b>SUCCESS!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"✅ <b>{count} class(es) scheduled!</b>\n\n"
+        f"📌 <i>Subject:</i> <b>{sub}</b>\n"
+        f"🎯 <i>Batch:</i> <b>CSDA + AICS</b>\n"
+        f"💬 <i>Topic:</i> <b>{topic_name}</b>\n"
+        f"⏰ <i>Time:</i> <b>{t_str}</b>\n\n"
+        f"<i>Notifications will be sent to both batches!</i> 🚀"
+    )
+    if isinstance(update_obj, Update): await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    else: await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    return ConversationHandler.END
+
+async def combined_wizard_msg_choice(update, context):
+    """Handle message type choice for combined wizard"""
+    if update.callback_query.data == "msg_manual":
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            "✍️ <b>CUSTOM MESSAGE</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "<i>Type your announcement below:</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return INPUT_MANUAL_MSG
+    else:
+        context.user_data['sch_manual_msg'] = None
+        return await combined_wizard_finalize(update.callback_query, context)
+
+async def combined_wizard_manual_msg(update, context):
+    """Handle manual message input for combined wizard"""
+    context.user_data['sch_manual_msg'] = update.message.text
+    return await combined_wizard_finalize(update, context)
 
 # ==============================================================================
 # ➕ 10. ADD SUBJECT & EDIT
@@ -4340,6 +4478,26 @@ def main():
             CUSTOM_OFFSET_INPUT: [MessageHandler(txt_filter, wizard_custom_offset)],
             MSG_TYPE_CHOICE: [CallbackQueryHandler(wizard_msg_choice, pattern="^msg_")],
             INPUT_MANUAL_MSG: [MessageHandler(txt_filter, wizard_manual_msg)]
+        },
+        fallbacks=[MessageHandler(filters.Regex(MENU_REGEX), cancel_wizard)],
+        conversation_timeout=300
+    ))
+
+    # Combined Schedule (CSDA + AICS at once)
+    app.add_handler(ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^📅 Schedule Classes$"), init_combined_schedule_wizard)],
+        states={
+            COMBINED_SELECT_SUB: [CallbackQueryHandler(combined_pick_sub, pattern="^cpick_")],
+            SELECT_DAYS: [CallbackQueryHandler(wizard_toggle_days, pattern="^toggle_|^days_done")],
+            INPUT_START_DATE: [MessageHandler(txt_filter, wizard_start_date)],
+            INPUT_END_DATE: [MessageHandler(txt_filter, wizard_end_date)],
+            INPUT_TIME: [MessageHandler(txt_filter, wizard_time)],
+            INPUT_LINK: [MessageHandler(txt_filter, wizard_link)],
+            SELECT_TOPIC: [CallbackQueryHandler(wizard_topic_selection, pattern="^topic_")],
+            SELECT_OFFSET: [CallbackQueryHandler(wizard_offset, pattern="^offset_")],
+            CUSTOM_OFFSET_INPUT: [MessageHandler(txt_filter, wizard_custom_offset)],
+            MSG_TYPE_CHOICE: [CallbackQueryHandler(combined_wizard_msg_choice, pattern="^msg_")],
+            INPUT_MANUAL_MSG: [MessageHandler(txt_filter, combined_wizard_manual_msg)]
         },
         fallbacks=[MessageHandler(filters.Regex(MENU_REGEX), cancel_wizard)],
         conversation_timeout=300
