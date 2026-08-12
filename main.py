@@ -179,10 +179,45 @@ DEFAULT_DB = {
 
 DB = DEFAULT_DB.copy()
 
+
+def _ensure_db_shape():
+    """
+    Guarantee every top-level DB key exists AND has the correct type.
+
+    `dict.get(key, default)` only returns the default when the key is MISSING.
+    A key explicitly set to null — which happens with partial/hand-edited
+    imports and with JSON round-trips through Supabase — returns None, so
+    `DB["subjects"].get(batch)` then raises
+    "'NoneType' object has no attribute 'get'". Rather than trusting the stored
+    shape anywhere it is read, normalise it once here.
+    """
+    global DB
+    if not isinstance(DB, dict):
+        DB = json.loads(json.dumps(DEFAULT_DB))
+        return
+
+    for k in ("config", "subjects", "attendance", "system_stats", "topics"):
+        if not isinstance(DB.get(k), dict):
+            DB[k] = {}
+    for k in ("active_jobs", "feedback", "schedules", "admins"):
+        if not isinstance(DB.get(k), list):
+            DB[k] = []
+
+    DB["config"].setdefault("group_id", int(ENV_GROUP_ID) if ENV_GROUP_ID else None)
+    DB["config"].setdefault("group_name", "❌ No Group Linked")
+    for b in ("CSDA", "AICS"):
+        if not isinstance(DB["subjects"].get(b), list):
+            DB["subjects"][b] = []
+    DB["system_stats"].setdefault("start_time", time.time())
+    DB["system_stats"].setdefault("classes_scheduled", 0)
+    DB["system_stats"].setdefault("ai_requests", 0)
+
+
 def load_db():
     global DB
     if not supabase:
         logger.warning("⚠️ Using In-Memory DB (No Supabase)")
+        _ensure_db_shape()
         return
 
     try:
@@ -193,17 +228,14 @@ def load_db():
                 save_db()
             else:
                 DB = cloud_data
-                if "active_jobs" not in DB: DB["active_jobs"] = []
-                if "schedules" not in DB: DB["schedules"] = []
-                if "subjects" not in DB: DB["subjects"] = {"CSDA": [], "AICS": []}
-                if "admins" not in DB: DB["admins"] = []
-                if "topics" not in DB: DB["topics"] = {}
+                _ensure_db_shape()
                 logger.info("📂 Database Loaded from Supabase.")
         else:
             logger.info("🆕 No Cloud Data found. Initializing...")
             save_db()
     except Exception as e:
         logger.error(f"❌ Failed to load DB from Cloud: {e}")
+        _ensure_db_shape()
 
 def _save_db_thread():
     if not supabase: return
@@ -273,6 +305,7 @@ def refresh_db():
                 # Keep local active_jobs if cloud has none (runtime jobs)
                 if not cloud_data.get("active_jobs"):
                     DB["active_jobs"] = old_active_jobs
+                _ensure_db_shape()
                 logger.info("🔄 Database refreshed from Supabase")
                 return True
     except Exception as e:
@@ -348,18 +381,28 @@ def cleanup_old_data(context=None):
     thirty_days = 30 * 24 * 60 * 60
     
     # 1. Clean Attendance
+    # Previously this read the timestamp from parts[3] of the job ID. For the
+    # common 3-part ID that index does not exist (so nothing was ever pruned),
+    # and for 4-part 'cmsg_' IDs it was the counter — meaning `now - 0 > 30 days`
+    # was true and brand-new records were deleted immediately. Use the stored
+    # timestamp, and only fall back to parsing the ID.
     keys_to_remove = []
-    if "attendance" in DB:
-        for job_id in DB["attendance"]:
+    if isinstance(DB.get("attendance"), dict):
+        for job_id, rec in DB["attendance"].items():
             try:
-                parts = job_id.split('_')
-                if len(parts) >= 4:
-                    ts = int(parts[3])
-                    if now_ts - ts > thirty_days:
-                        keys_to_remove.append(job_id)
-            except:
+                ts = None
+                if isinstance(rec, dict):
+                    ts = rec.get("class_ts") or rec.get("sent_ts")
+                if ts is None:
+                    ts = _legacy_ts_from_job_id(job_id)
+                # Unknown age: keep it. Never delete data we can't date.
+                if ts is None:
+                    continue
+                if now_ts - float(ts) > thirty_days:
+                    keys_to_remove.append(job_id)
+            except Exception:
                 continue
-            
+
     for k in keys_to_remove:
         del DB["attendance"][k]
         cleaned += 1
@@ -473,16 +516,50 @@ def safe_job_data(job):
         return job.data
     return {}
 
-def safe_decode(text):
-    """Safely decode text removing surrogate pairs that crash strings"""
-    if not text: return "No content"
+def safe_text(text, default=""):
+    """
+    Make any string safe to send over HTTP/Telegram.
+
+    Fixes the 'surrogates not allowed' UnicodeEncodeError. Data that round-trips
+    through JSON (Supabase) or comes from Telegram display names can contain
+    UTF-16 surrogate pairs (e.g. '\\ud83d\\udcac') which Python treats as two
+    lone code points that CANNOT be encoded to UTF-8.
+
+    Strategy:
+      1. If it already encodes cleanly, return as-is (fast path).
+      2. A surrogate PAIR is valid UTF-16 — round-tripping through UTF-16 with
+         'surrogatepass' RESTORES the real character (\\ud83d\\udcac -> 💬).
+      3. Truly unpaired surrogates can't be recovered, so drop them.
+    """
+    if text is None:
+        return default
     try:
-        # First ensure it's a string
         text = str(text)
-        # Encode to utf-8 replacing errors, then decode back
-        return text.encode('utf-8', 'replace').decode('utf-8')
     except Exception:
-        return "Content Error"
+        return default
+    if text == "":
+        return default
+    try:
+        text.encode('utf-8')
+        return text
+    except UnicodeEncodeError:
+        pass
+    try:
+        return text.encode('utf-16', 'surrogatepass').decode('utf-16')
+    except Exception:
+        try:
+            return text.encode('utf-8', 'ignore').decode('utf-8') or default
+        except Exception:
+            return default
+
+
+def safe_decode(text):
+    """Backwards-compatible wrapper. Kept because existing callers rely on the
+    'No content' placeholder for empty values."""
+    return safe_text(text, default="No content")
+
+
+
 
 async def send_long_message(bot, chat_id, text, parse_mode=None, reply_markup=None, **kwargs):
     """
@@ -2680,6 +2757,9 @@ async def send_alert_job(context: ContextTypes.DEFAULT_TYPE):
                     logger.warning(f"Fallback 3 failed for {job.name}: {e3}")
         
         if sent:
+            # Record which class this attendance button belongs to NOW, while we
+            # still have the job data. The report must never guess it from the ID.
+            seed_attendance_record(job.name, data)
             remove_job_from_db(job.name)
             logger.info(f"✅ Alert sent: {job.name}")
         else:
@@ -3659,6 +3739,9 @@ async def handle_import_file(update, context):
             "admins": imported_data.get("admins", []),
             "topics": imported_data.get("topics", {})
         }
+        # A key present but set to null bypasses the defaults above, so coerce
+        # types before anything reads the imported shape.
+        _ensure_db_shape()
         
         # Save to cloud
         save_db()
@@ -3704,20 +3787,128 @@ async def handle_import_file(update, context):
     finally:
         context.user_data['wait_import'] = False
 
+# ------------------------------------------------------------------------------
+# 📊 ATTENDANCE RECORDS
+# ------------------------------------------------------------------------------
+# An attendance record is a dict:
+#   {
+#     "batch": str, "subject": str, "time_display": "HH:MM",
+#     "class_ts": epoch of class start, "sent_ts": epoch the alert went out,
+#     "users": [ {"id", "username", "name", "ts"} ]
+#   }
+# Older builds stored a bare list of name strings, so every reader goes through
+# _normalize_attendance() rather than assuming a shape.
+
+def _class_timestamp(time_display, fallback_ts=None):
+    """Epoch for today's HH:MM in IST. Falls back if unparseable."""
+    try:
+        h, m = str(time_display).strip().split(":")[:2]
+        now = datetime.now(IST)
+        return now.replace(hour=int(h), minute=int(m[:2]), second=0,
+                           microsecond=0).timestamp()
+    except Exception:
+        return fallback_ts if fallback_ts is not None else time.time()
+
+
+def _normalize_attendance(rec):
+    """Return a record dict regardless of whether `rec` is new-style or a
+    legacy list of plain name strings."""
+    if isinstance(rec, dict):
+        users = rec.get("users")
+        if not isinstance(users, list):
+            users = []
+        clean = []
+        for u in users:
+            if isinstance(u, dict):
+                clean.append(u)
+            else:
+                clean.append({"id": None, "username": None,
+                              "name": safe_text(u, "Unknown"), "ts": None})
+        out = dict(rec)
+        out["users"] = clean
+        return out
+    if isinstance(rec, list):
+        return {
+            "batch": None, "subject": None, "time_display": None,
+            "class_ts": None, "sent_ts": None,
+            "users": [{"id": None, "username": None,
+                       "name": safe_text(u, "Unknown"), "ts": None}
+                      for u in rec],
+            "_legacy": True,
+        }
+    return {"batch": None, "subject": None, "time_display": None,
+            "class_ts": None, "sent_ts": None, "users": []}
+
+
+def _display_name(user):
+    """Prefer @username; fall back to full name, then first name, then ID."""
+    uname = safe_text(getattr(user, "username", None) or "", "")
+    if uname:
+        return uname
+    first = safe_text(getattr(user, "first_name", None) or "", "")
+    last = safe_text(getattr(user, "last_name", None) or "", "")
+    full = (first + " " + last).strip()
+    return full or f"User {getattr(user, 'id', '?')}"
+
+
+def seed_attendance_record(job_name, data):
+    """Store class metadata the moment the alert is sent, so the report never
+    has to reverse-engineer it out of the job-ID string."""
+    try:
+        if not isinstance(DB.get("attendance"), dict):
+            DB["attendance"] = {}
+        existing = DB["attendance"].get(job_name)
+        users = _normalize_attendance(existing)["users"] if existing else []
+        DB["attendance"][job_name] = {
+            "batch": safe_text(data.get("batch"), "—"),
+            "subject": safe_text(data.get("subject"), "Class"),
+            "time_display": safe_text(data.get("time_display"), ""),
+            "class_ts": _class_timestamp(data.get("time_display")),
+            "sent_ts": time.time(),
+            "users": users,
+        }
+    except Exception as e:
+        logger.error(f"Failed to seed attendance for {job_name}: {e}")
+
+
 async def mark_attendance(update, context):
     query = update.callback_query
     job_id = query.data.replace("att_", "")
     user = query.from_user
-    uid = user.username or user.first_name
 
-    if job_id not in DB["attendance"]: DB["attendance"][job_id] = []
+    try:
+        if not isinstance(DB.get("attendance"), dict):
+            DB["attendance"] = {}
 
-    if uid in DB["attendance"][job_id]:
-        await query.answer("⚠️ Already marked!", show_alert=True)
-    else:
-        DB["attendance"][job_id].append(uid)
+        rec = _normalize_attendance(DB["attendance"].get(job_id))
+        # Alert was sent by an older build (or before a restart) — keep whatever
+        # we can rather than dropping the tap.
+        rec.pop("_legacy", None)
+        if rec.get("class_ts") is None:
+            rec["class_ts"] = time.time()
+
+        name = _display_name(user)
+        if any(u.get("id") == user.id for u in rec["users"] if u.get("id")) or \
+           any(u.get("name") == name for u in rec["users"]):
+            await query.answer("⚠️ Already marked!", show_alert=True)
+            return
+
+        rec["users"].append({
+            "id": user.id,
+            "username": safe_text(user.username, "") or None,
+            "name": name,
+            "ts": time.time(),
+        })
+        DB["attendance"][job_id] = rec
         save_db()
-        await query.answer(f"✅ Present: {uid}")
+        await query.answer(f"✅ Marked present: {name}")
+    except Exception as e:
+        logger.error(f"mark_attendance failed for {job_id}: {e}")
+        try:
+            await query.answer("❌ Could not mark attendance. Try again.",
+                               show_alert=True)
+        except Exception:
+            pass
 
 async def view_schedule_handler(update, context):
     """View schedule with pagination"""
@@ -3805,37 +3996,132 @@ async def prompt_image_upload(update, context):
         parse_mode=ParseMode.HTML
     )
 
+def _legacy_ts_from_job_id(job_id):
+    """
+    Best-effort timestamp for records saved before metadata was stored.
+
+    Job IDs come in several shapes:
+        CSDA_1755000000_3          -> batch_timestamp_counter
+        COMBINED_1755000000_3
+        cmsg_CSDA_1755000000_3
+        <any of the above>_retry2
+    The old report read parts[2], which is the COUNTER for the common 3-part
+    form — that is why every row rendered as 01 Jan 1970, 05:30 IST
+    (epoch 0 in IST). Scan for a value that is plausibly a unix timestamp
+    instead of trusting a fixed position.
+    """
+    for part in str(job_id).split('_'):
+        if part.isdigit() and len(part) >= 9:
+            try:
+                v = int(part)
+                if 1_000_000_000 < v < 4_000_000_000:
+                    return v
+            except Exception:
+                continue
+    return None
+
+
+def _legacy_batch_from_job_id(job_id):
+    parts = str(job_id).split('_')
+    if not parts:
+        return None
+    head = parts[0]
+    if head == "cmsg":
+        return parts[1] if len(parts) > 1 else "Custom"
+    if head == "COMBINED":
+        return "CSDA & AICS"
+    return head or None
+
+
 async def view_attendance_stats(update, context):
+    """Attendance report: who attended which class, when."""
     if not await require_private_admin(update, context): return
-    keys = list(DB["attendance"].keys())[-10:]
-    if not keys:
+
+    if not isinstance(DB.get("attendance"), dict):
+        DB["attendance"] = {}
+
+    raw = DB["attendance"]
+    if not raw:
         await update.message.reply_text(
-            "📊 <b>NO ATTENDANCE DATA!</b>\n\n"
-            "<i>No classes have been held yet.</i>",
+            "📊 <b>NO ATTENDANCE DATA</b>\n\n"
+            "<i>No class alerts have gone out yet, so there is nothing to "
+            "report.</i>",
             parse_mode=ParseMode.HTML
         )
         return
-    
-    msg = (
-        "📊 <b>ATTENDANCE REPORT</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<i>Last 10 classes:</i>\n\n"
+
+    # Build a sortable list so the newest class appears first.
+    entries = []
+    for job_id, rec_raw in raw.items():
+        rec = _normalize_attendance(rec_raw)
+        ts = rec.get("class_ts") or rec.get("sent_ts") or _legacy_ts_from_job_id(job_id)
+        entries.append({
+            "job_id": job_id,
+            "ts": ts,
+            "batch": rec.get("batch") or _legacy_batch_from_job_id(job_id) or "—",
+            "subject": rec.get("subject"),
+            "time_display": rec.get("time_display"),
+            "users": rec.get("users", []),
+        })
+    entries.sort(key=lambda e: (e["ts"] is not None, e["ts"] or 0), reverse=True)
+
+    shown = entries[:10]
+    total_marks = sum(len(e["users"]) for e in entries)
+
+    msg = "📊 <b>ATTENDANCE REPORT</b>\n" + "━" * 24 + "\n\n"
+
+    for e in shown:
+        # ── Heading: subject, falling back to batch when unknown ──
+        subject = e["subject"]
+        if subject and subject != "Custom":
+            code, name = _split_subject(subject)
+            heading = html.escape(safe_text(name, "Class"))
+            sub_line = html.escape(safe_text(code, "")) if code else ""
+        else:
+            heading = html.escape(safe_text(e["batch"], "Class"))
+            sub_line = ""
+
+        msg += f"📖 <b>{heading}</b>\n"
+        if sub_line:
+            msg += f"   <i>{sub_line}</i>\n"
+
+        # ── When ──
+        if e["ts"]:
+            dt = datetime.fromtimestamp(e["ts"], IST)
+            when = dt.strftime("%a, %d %b %Y")
+            clock = e["time_display"] or dt.strftime("%H:%M")
+            msg += f"   🕒 {html.escape(_format_time_12h(clock))}  ·  {when}\n"
+        else:
+            msg += "   🕒 <i>time unknown</i>\n"
+
+        msg += f"   🎓 {html.escape(safe_text(e['batch'], '—'))}\n"
+
+        # ── Who ──
+        users = e["users"]
+        if users:
+            msg += f"   👥 <b>{len(users)} present</b>\n"
+            for u in users[:15]:
+                uname = safe_text(u.get("username"), "")
+                nm = html.escape(safe_text(u.get("name"), "Unknown"))
+                label = f"@{html.escape(uname)}" if uname else nm
+                marked = ""
+                if u.get("ts"):
+                    marked = f" <i>({datetime.fromtimestamp(u['ts'], IST).strftime('%H:%M')})</i>"
+                msg += f"      • {label}{marked}\n"
+            if len(users) > 15:
+                msg += f"      <i>…and {len(users) - 15} more</i>\n"
+        else:
+            msg += "   👥 <i>nobody marked present</i>\n"
+        msg += "\n"
+
+    msg += "━" * 24 + "\n"
+    msg += (f"<i>Showing {len(shown)} of {len(entries)} classes · "
+            f"{total_marks} total check-ins</i>")
+
+    await send_message_safe(
+        context.bot, update.effective_chat.id, safe_text(msg),
+        parse_mode=ParseMode.HTML, disable_web_page_preview=True
     )
-    for k in keys:
-        try:
-            parts = k.split('_')
-            # Extract info from ID: batch_day_timestamp_count
-            batch = safe_decode(parts[0])
-            ts = int(parts[2])
-            date_str = datetime.fromtimestamp(ts, IST).strftime("%d %b, %H:%M")
-            count = len(DB['attendance'][k])
-            
-            msg += f"📅 <b>{date_str}</b>\n"
-            msg += f"   📖 {html.escape(batch)}\n"
-            msg += f"   👥 <i>{count} present</i>\n\n"
-        except Exception: 
-            continue
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 async def handle_photo(update, context):
     if not await require_private_admin(update, context): return
@@ -4030,14 +4316,18 @@ async def viewfeedback_handler(update, context):
     
     if not feedback_list:
         await update.message.reply_text(
-            "\ud83d\udced <b>NO FEEDBACK YET!</b>\n\n"
+            "📭 <b>NO FEEDBACK YET!</b>\n\n"
             "<i>No feedback has been submitted.</i>",
             parse_mode=ParseMode.HTML
         )
         return
     
     # Build feedback display - handle both old (string) and new (dict) formats
-    msg = "\ud83d\udcac <b>FEEDBACK INBOX</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+    # NOTE: emoji must be written as real characters. Writing them as UTF-16
+    # surrogate escapes ('\ud83d\udcac') creates unpaired surrogates that cannot
+    # be encoded to UTF-8, which crashed this command with
+    # "UnicodeEncodeError: surrogates not allowed".
+    msg = "💬 <b>FEEDBACK INBOX</b>\n" + "━" * 24 + "\n\n"
     
     # Show last 10 feedback entries (newest first)
     recent_feedback = feedback_list[-10:][::-1]
@@ -4052,9 +4342,10 @@ async def viewfeedback_handler(update, context):
             user_id = entry.get("user_id", "N/A")
             chat_type = safe_decode(entry.get("chat_type", "Unknown"))
             
-            msg += f"<b>{i}.</b> 📅 {timestamp}\n"
-            msg += f"   👤 <b>{html.escape(name)}</b> (@{html.escape(username)})\n"
-            msg += f"   🆔 <code>{user_id}</code>\n"
+            handle = f" (@{html.escape(username)})" if username and username != "no_username" else ""
+            msg += f"<b>{i}.</b> 📅 {html.escape(safe_text(timestamp, 'Unknown time'))}\n"
+            msg += f"   👤 <b>{html.escape(name)}</b>{handle}\n"
+            msg += f"   🆔 <code>{html.escape(str(user_id))}</code>\n"
             msg += f"   📍 {html.escape(chat_type)}\n"
             msg += f"   📝 <i>{html.escape(message[:100])}{'...' if len(message) > 100 else ''}</i>\n\n"
         else:
@@ -4065,10 +4356,14 @@ async def viewfeedback_handler(update, context):
             msg += f"<b>{i}.</b> {escaped_entry}{'...' if len(safe_raw) > 150 else ''}\n\n"
     
     total = len(feedback_list)
-    msg += f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+    msg += "━" * 24 + "\n"
     msg += f"<i>Showing {len(recent_feedback)} of {total} total feedback entries</i>"
     
-    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    # Final safety net: one bad character anywhere must not kill the whole reply.
+    await send_message_safe(
+        context.bot, update.effective_chat.id, safe_text(msg),
+        parse_mode=ParseMode.HTML, disable_web_page_preview=True
+    )
 
 async def delete_menu(update, context):
     """Delete classes with pagination - single message UI"""
@@ -4397,13 +4692,46 @@ async def confirm_reset_db(update, context):
 # ==============================================================================
 # ✏️ 16. EDIT SUBJECT COMMAND
 # ==============================================================================
+def _subject_list(batch):
+    """
+    Always return a real list for a batch.
+
+    DB["subjects"] can be None after an import whose JSON had "subjects": null,
+    and the batch key itself may be missing or hold a non-list. Reading it
+    directly is what produced "'NoneType' object has no attribute 'get'".
+    """
+    _ensure_db_shape()
+    subs = DB["subjects"].get(batch)
+    if not isinstance(subs, list):
+        subs = []
+        DB["subjects"][batch] = subs
+    return subs
+
+
+async def _esub_expired(query):
+    """Wizard state was lost (timeout, restart, or a stale button)."""
+    try:
+        await query.edit_message_text(
+            "⌛ <b>THIS MENU EXPIRED</b>\n\n"
+            "<i>Run /editsubject again to start over.</i>",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
+    return ConversationHandler.END
+
+
 async def start_edit_subject(update, context):
     """Start the edit subject wizard"""
     if not await require_private_admin(update, context): return ConversationHandler.END
-    
+
+    context.user_data.pop('esub_batch', None)
+    context.user_data.pop('esub_subject', None)
+
     kb = [
-        [InlineKeyboardButton("🟦 CSDA", callback_data="esub_CSDA"), 
-         InlineKeyboardButton("🟧 AICS", callback_data="esub_AICS")]
+        [InlineKeyboardButton("🟦 CSDA", callback_data="esub_batch_CSDA"),
+         InlineKeyboardButton("🟧 AICS", callback_data="esub_batch_AICS")],
+        [InlineKeyboardButton("🔙 Cancel", callback_data="esub_cancel")]
     ]
     await update.message.reply_text(
         "✏️ <b>EDIT SUBJECT</b>\n"
@@ -4414,29 +4742,39 @@ async def start_edit_subject(update, context):
     )
     return EDIT_SUB_SELECT_BATCH
 
+
 async def edit_sub_select_batch(update, context):
     """Handle batch selection and show subjects"""
     query = update.callback_query
     await query.answer()
-    
-    batch = query.data.split("_")[1]
+
+    if query.data == "esub_cancel":
+        await query.edit_message_text("❌ Cancelled.")
+        return ConversationHandler.END
+
+    parts = query.data.split("_", 2)
+    if len(parts) < 3:
+        return await _esub_expired(query)
+    batch = parts[2]
     context.user_data['esub_batch'] = batch
-    
-    subs = DB["subjects"].get(batch, [])
+
+    subs = _subject_list(batch)
     if not subs:
         await query.edit_message_text(
-            f"⚠️ <b>NO SUBJECTS IN {batch}!</b>\n\n"
-            f"<i>Add some subjects first.</i>"
+            f"⚠️ <b>NO SUBJECTS IN {html.escape(batch)}</b>\n\n"
+            f"<i>Add a subject first, then come back.</i>",
+            parse_mode=ParseMode.HTML
         )
         return ConversationHandler.END
-        
-    rows = []
-    for s in subs:
-        rows.append([InlineKeyboardButton(f"📖 {s}", callback_data=f"esub_pick_{s}")])
+
+    # Index-based callback data: subject names can exceed Telegram's 64-byte
+    # callback_data limit and may contain the '_' used as a delimiter.
+    rows = [[InlineKeyboardButton(f"📖 {s}", callback_data=f"esub_pick_{i}")]
+            for i, s in enumerate(subs)]
     rows.append([InlineKeyboardButton("🔙 Cancel", callback_data="esub_cancel")])
-    
+
     await query.edit_message_text(
-        f"✏️ <b>EDIT SUBJECT ({batch})</b>\n"
+        f"✏️ <b>EDIT SUBJECT ({html.escape(batch)})</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<i>Select a subject to modify:</i> 👇",
         reply_markup=InlineKeyboardMarkup(rows),
@@ -4444,27 +4782,37 @@ async def edit_sub_select_batch(update, context):
     )
     return EDIT_SUB_SELECT_SUBJECT
 
+
 async def edit_sub_select_subject(update, context):
     """Handle subject selection and show actions"""
     query = update.callback_query
     await query.answer()
-    
-    data = query.data
-    if data == "esub_cancel":
+
+    if query.data == "esub_cancel":
         await query.edit_message_text("❌ Cancelled.")
         return ConversationHandler.END
-        
-    sub = data.replace("esub_pick_", "")
+
+    batch = context.user_data.get('esub_batch')
+    if not batch:
+        return await _esub_expired(query)
+
+    subs = _subject_list(batch)
+    try:
+        idx = int(query.data.rsplit("_", 1)[1])
+        sub = subs[idx]
+    except (ValueError, IndexError):
+        return await _esub_expired(query)
+
     context.user_data['esub_subject'] = sub
-    
+
     kb = [
         [InlineKeyboardButton("✏️ Rename", callback_data="esub_rename")],
         [InlineKeyboardButton("🗑️ Delete", callback_data="esub_delete")],
         [InlineKeyboardButton("🔙 Cancel", callback_data="esub_cancel")]
     ]
-    
+
     await query.edit_message_text(
-        f"🛠️ <b>MANAGE: {sub}</b>\n"
+        f"🛠️ <b>MANAGE: {html.escape(sub)}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<i>What would you like to do?</i>",
         reply_markup=InlineKeyboardMarkup(kb),
@@ -4472,61 +4820,106 @@ async def edit_sub_select_subject(update, context):
     )
     return EDIT_SUB_ACTION
 
+
 async def edit_sub_action(update, context):
     """Handle rename or delete action"""
     query = update.callback_query
     await query.answer()
-    
+
     action = query.data
     if action == "esub_cancel":
         await query.edit_message_text("❌ Cancelled.")
         return ConversationHandler.END
-        
+
+    batch = context.user_data.get('esub_batch')
+    sub = context.user_data.get('esub_subject')
+    if not batch or not sub:
+        return await _esub_expired(query)
+
     if action == "esub_delete":
-        batch = context.user_data['esub_batch']
-        sub = context.user_data['esub_subject']
-        
-        if sub in DB["subjects"][batch]:
-            DB["subjects"][batch].remove(sub)
+        subs = _subject_list(batch)
+        if sub in subs:
+            subs.remove(sub)
             save_db()
-            
-        await query.edit_message_text(
-            f"🗑️ <b>DELETED!</b>\n\n"
-            f"✅ <i>{sub} has been removed from {batch}.</i>",
-            parse_mode=ParseMode.HTML
-        )
+            await query.edit_message_text(
+                f"🗑️ <b>DELETED</b>\n\n"
+                f"<i>{html.escape(sub)} was removed from {html.escape(batch)}.</i>",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await query.edit_message_text(
+                f"⚠️ <b>ALREADY GONE</b>\n\n"
+                f"<i>{html.escape(sub)} is no longer in {html.escape(batch)}.</i>",
+                parse_mode=ParseMode.HTML
+            )
         return ConversationHandler.END
-        
+
     if action == "esub_rename":
         await query.edit_message_text(
-            "✍️ <b>RENAME SUBJECT</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "<i>Enter the new name:</i>",
+            f"✍️ <b>RENAME SUBJECT</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<b>Current:</b> {html.escape(sub)}\n\n"
+            f"<i>Send the new name, or /cancel to abort.</i>",
             parse_mode=ParseMode.HTML
         )
         return EDIT_SUB_NEW_NAME
 
+    # Unrecognised callback (stale button): stay put rather than fall through
+    # returning None with no feedback.
+    return await _esub_expired(query)
+
+
 async def edit_sub_save_rename(update, context):
     """Save the renamed subject"""
-    new_name = update.message.text.strip()
-    batch = context.user_data['esub_batch']
-    old_name = context.user_data['esub_subject']
-    
-    if new_name == old_name:
-        await update.message.reply_text("⚠️ Name is same as before.")
+    new_name = safe_text(update.message.text, "").strip()
+    batch = context.user_data.get('esub_batch')
+    old_name = context.user_data.get('esub_subject')
+
+    if not batch or not old_name:
+        await update.message.reply_text(
+            "⌛ <b>THIS WIZARD EXPIRED</b>\n\n"
+            "<i>Run /editsubject again.</i>",
+            parse_mode=ParseMode.HTML
+        )
         return ConversationHandler.END
-        
-    if old_name in DB["subjects"][batch]:
-        # Rename in list (preserve order)
-        idx = DB["subjects"][batch].index(old_name)
-        DB["subjects"][batch][idx] = new_name
-        save_db()
-        
+
+    if not new_name:
+        await update.message.reply_text(
+            "⚠️ <b>Name cannot be empty.</b>\n\n<i>Send a name or /cancel.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return EDIT_SUB_NEW_NAME
+
+    if new_name == old_name:
+        await update.message.reply_text("⚠️ That is the same name as before.")
+        return ConversationHandler.END
+
+    subs = _subject_list(batch)
+    if new_name in subs:
+        await update.message.reply_text(
+            f"⚠️ <b>{html.escape(new_name)}</b> already exists in "
+            f"{html.escape(batch)}.\n\n<i>Pick a different name.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return EDIT_SUB_NEW_NAME
+
+    if old_name not in subs:
+        await update.message.reply_text(
+            f"⚠️ <b>{html.escape(old_name)}</b> is no longer in "
+            f"{html.escape(batch)}. Nothing was changed.",
+            parse_mode=ParseMode.HTML
+        )
+        return ConversationHandler.END
+
+    subs[subs.index(old_name)] = new_name   # preserve position
+    save_db()
+
     await update.message.reply_text(
-        f"✅ <b>RENAMED!</b>\n"
+        f"✅ <b>RENAMED</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🔄 <b>{old_name}</b> ➡️ <b>{new_name}</b>\n"
-        f"<i>Database updated.</i>",
+        f"{html.escape(old_name)}\n"
+        f"➡️ <b>{html.escape(new_name)}</b>\n\n"
+        f"<i>Saved. Existing scheduled classes keep their old label.</i>",
         parse_mode=ParseMode.HTML
     )
     return ConversationHandler.END
@@ -4570,35 +4963,49 @@ async def attendance_command(update, context):
 # ==============================================================================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Log errors and notify admins"""
-    logger.error(f"Exception: {context.error}")
+    # Log the full traceback. Logging only str(error) gave messages like
+    # "'NoneType' object has no attribute 'get'" with no indication of where.
+    logger.error(
+        "Exception: %s\n%s",
+        context.error,
+        "".join(traceback.format_exception(type(context.error), context.error,
+                                          context.error.__traceback__))
+        if context.error else "(no traceback)"
+    )
     
     # Try to notify the user if possible
     if update and hasattr(update, 'effective_message') and update.effective_message:
-        error_msg = str(context.error)
-        
-        # Check for specific known errors
+        error_msg = safe_text(context.error, "Unknown error")
+
         if "Conflict" in error_msg:
-            await update.effective_message.reply_text(
+            notice = (
                 "⚠️ <b>BOT CONFLICT DETECTED!</b>\n\n"
                 "<i>Multiple bot instances are running.</i>\n\n"
                 "🔧 <b>Quick Fix:</b> Use /reset\n"
-                "🛡️ <b>Permanent Fix:</b> Revoke token via @BotFather",
-                parse_mode=ParseMode.HTML
+                "🛡️ <b>Permanent Fix:</b> Revoke token via @BotFather"
             )
         elif "Button_data_invalid" in error_msg:
-            await update.effective_message.reply_text(
+            notice = (
                 "⚠️ <b>BUTTON ERROR!</b>\n\n"
                 "<i>Some buttons have expired data.</i>\n\n"
-                "🔧 <b>Fix:</b> Use /reset to clear old jobs",
-                parse_mode=ParseMode.HTML
+                "🔧 <b>Fix:</b> Use /reset to clear old jobs"
             )
         else:
-            await update.effective_message.reply_text(
+            # Escape the error text. Interpolating it raw into <code> meant an
+            # error containing '<' or '&' failed to send, hiding the real cause.
+            notice = (
                 f"❌ <b>AN ERROR OCCURRED</b>\n\n"
-                f"<code>{error_msg[:200]}</code>\n\n"
-                f"<i>Try /reset if issues persist.</i>",
-                parse_mode=ParseMode.HTML
+                f"<code>{html.escape(error_msg[:200])}</code>\n\n"
+                f"<i>Try /reset if issues persist.</i>"
             )
+
+        # Never let the notifier itself raise — that would re-enter the handler.
+        try:
+            await update.effective_message.reply_text(
+                notice, parse_mode=ParseMode.HTML
+            )
+        except Exception as notify_err:
+            logger.error(f"Could not deliver error notice: {notify_err}")
 
 # ==============================================================================
 # 🚀 16. MAIN
@@ -5078,9 +5485,9 @@ def main():
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("editsubject", start_edit_subject)],
         states={
-            EDIT_SUB_SELECT_BATCH: [CallbackQueryHandler(edit_sub_select_batch, pattern="^esub_")],
-            EDIT_SUB_SELECT_SUBJECT: [CallbackQueryHandler(edit_sub_select_subject, pattern="^esub_")],
-            EDIT_SUB_ACTION: [CallbackQueryHandler(edit_sub_action, pattern="^esub_")],
+            EDIT_SUB_SELECT_BATCH: [CallbackQueryHandler(edit_sub_select_batch, pattern="^esub_(batch_|cancel$)")],
+            EDIT_SUB_SELECT_SUBJECT: [CallbackQueryHandler(edit_sub_select_subject, pattern="^esub_(pick_\\d+|cancel)$")],
+            EDIT_SUB_ACTION: [CallbackQueryHandler(edit_sub_action, pattern="^esub_(rename|delete|cancel)$")],
             EDIT_SUB_NEW_NAME: [MessageHandler(txt_filter, edit_sub_save_rename)]
         },
         fallbacks=[CommandHandler("cancel", cancel_wizard), MessageHandler(filters.Regex(MENU_REGEX), cancel_wizard)],
