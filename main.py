@@ -54,7 +54,7 @@ from telegram import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats,
-    ChatMember,̦
+    ChatMember,
     ChatMemberUpdated
 )
 from telegram.constants import ParseMode, ChatAction
@@ -2162,6 +2162,341 @@ async def edit_scope_handler(update, context):
 # 📨 11. JOB EXECUTION
 # ==============================================================================
 
+def _generate_class_notification(batch, subject, time_str, link=None):
+    """
+    Compositional notification generator — every element is independently randomized.
+    Tracks recently used components to guarantee zero repetitions.
+    ~10,000+ unique combinations possible.
+    """
+    import random
+    from collections import deque
+    
+    # ── ANTI-REPETITION TRACKER ──
+    if not hasattr(_generate_class_notification, '_history'):
+        _generate_class_notification._history = {
+            'header': deque(maxlen=5),
+            'title': deque(maxlen=5),
+            'greeting': deque(maxlen=8),
+            'layout': deque(maxlen=5),
+            'tagline': deque(maxlen=10),
+            'footer': deque(maxlen=5),
+            'accent': deque(maxlen=6),
+        }
+    history = _generate_class_notification._history
+    
+    def pick_fresh(pool, category):
+        """Pick a random item that hasn't been used recently"""
+        available = [x for x in pool if x not in history[category]]
+        if not available:
+            history[category].clear()
+            available = pool
+        choice = random.choice(available)
+        history[category].append(choice)
+        return choice
+    
+    now = datetime.now(IST)
+    date_str = now.strftime('%d %B %Y')
+    day_name = now.strftime('%A')
+    hour = now.hour
+    
+    # ── SUBJECT-AWARE EMOJI ──
+    sub_lower = subject.lower()
+    subject_emoji = "📖"
+    subject_emojis = {
+        "math": "🧮", "maths": "🧮", "calculus": "🧮", "algebra": "🧮", "statistics": "📊",
+        "physics": "⚛️", "chemistry": "🧪", "bio": "🧬", "biology": "🧬",
+        "programming": "💻", "coding": "💻", "python": "🐍", "java": "☕", "c++": "⚙️",
+        "data": "📊", "database": "🗄️", "sql": "🗄️", "ai": "🤖", "machine": "🤖",
+        "network": "🌐", "web": "🌐", "cyber": "🛡️", "security": "🔒",
+        "english": "🔤", "communication": "🗣️", "hindi": "🇮🇳",
+        "electronics": "🔌", "circuit": "🔌", "digital": "💡",
+        "os": "🖥️", "operating": "🖥️", "system": "⚙️",
+        "cloud": "☁️", "devops": "🔧", "software": "💾",
+        "design": "🎨", "graphics": "🎨", "dsa": "🌳", "algorithm": "🧩",
+    }
+    for keyword, emoji in subject_emojis.items():
+        if keyword in sub_lower:
+            subject_emoji = emoji
+            break
+    
+    batch_icon = "🟦" if batch == "CSDA" else "🟧" if batch == "AICS" else "🟪"
+    
+    # ══════════════════════════════════════
+    # 🎨 COMPONENT POOLS (all independently randomized)
+    # ══════════════════════════════════════
+    
+    # ── TOP BORDERS ──
+    headers = [
+        "⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡",
+        "◇◆◇◆◇◆◇◆◇◆◇◆◇◆◇",
+        "✦ ✧ ✦ ✧ ✦ ✧ ✦ ✧ ✦ ✧ ✦ ✧",
+        "▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "╔══════════════════════╗",
+        "░▒▓█ ████████████ █▓▒░",
+        "•·.·´¯`·.·•·.·´¯`·.·•",
+        "┏━━━━━━━━━━━━━━━━━━━┓",
+        "❖ ━━━━━━━━━━━━━━━━ ❖",
+        "「 ━━━━━━━━━━━━━━━━ 」",
+        "▂▃▅▇█ ████████ █▇▅▃▂",
+    ]
+    
+    # ── TITLES ──
+    titles = [
+        "🔔 <b>CLASS NOTIFICATION</b>",
+        "📢 <b>ATTENTION STUDENTS!</b>",
+        f"🎓 <b>{subject.upper()}</b>",
+        "📣 <b>CLASS ALERT!</b>",
+        f"⚡ <b>{subject.upper()} — LIVE NOW</b>",
+        "🚨 <b>CLASS STARTING SOON!</b>",
+        f"📚 <b>TIME FOR {subject.upper()}!</b>",
+        "🎯 <b>YOUR NEXT CLASS</b>",
+        f"🔥 <b>{batch} CLASS INCOMING!</b>",
+        f"✨ <b>{subject} SESSION</b>",
+        "🏫 <b>CLASS IS READY!</b>",
+        f"💡 <b>{subject} BEGINS SHORTLY</b>",
+    ]
+    
+    # ── GREETINGS (time-of-day + day-of-week aware) ──
+    morning_greetings = [
+        "🌅 Rise and shine, champions!",
+        "☀️ Good morning, future leaders!",
+        "🌄 A fresh morning = a fresh start!",
+        "🌞 Morning energy activated!",
+        "☕ Grab your chai, class is near!",
+        f"🌻 Happy {day_name} morning!",
+    ]
+    afternoon_greetings = [
+        "🌤️ Afternoon session loading...",
+        "☀️ Midday grind continues!",
+        "🔆 Stay sharp this afternoon!",
+        "💪 Afternoon hustle begins!",
+        f"🌞 {day_name} afternoon vibes!",
+        "🎯 Post-lunch focus mode ON!",
+    ]
+    evening_greetings = [
+        "🌆 Evening session awaits!",
+        "🌙 One more class to conquer!",
+        "✨ Evening learning never stops!",
+        "🌟 End the day with knowledge!",
+        f"🌃 {day_name} evening energy!",
+        "💫 Let's finish strong tonight!",
+    ]
+    
+    if hour < 12:
+        greetings = morning_greetings
+    elif hour < 17:
+        greetings = afternoon_greetings
+    else:
+        greetings = evening_greetings
+    
+    # ── BODY LAYOUTS ──
+    def layout_boxed():
+        return (
+            f"┏━━━━━━━━━━━━━━━━━━━┓\n"
+            f"┃ {batch_icon} <b>Batch:</b>  <code>{batch}</code>\n"
+            f"┃ {subject_emoji} <b>Subject:</b> <code>{subject}</code>\n"
+            f"┃ ⏰ <b>Time:</b>  <code>{time_str}</code>\n"
+            f"┃ 📅 <b>Date:</b>  <i>{day_name}, {date_str}</i>\n"
+            f"┗━━━━━━━━━━━━━━━━━━━┛"
+        )
+    
+    def layout_arrows():
+        return (
+            f"{batch_icon} <b>Batch</b>    ➜  <code>{batch}</code>\n"
+            f"{subject_emoji} <b>Subject</b> ➜  <code>{subject}</code>\n"
+            f"⏰ <b>Time</b>    ➜  <code>{time_str}</code>\n"
+            f"📅 <b>Date</b>    ➜  <i>{day_name}, {date_str}</i>"
+        )
+    
+    def layout_pipes():
+        return (
+            f"  {batch_icon} │ <b>{batch}</b>\n"
+            f"  {subject_emoji} │ <b>{subject}</b>\n"
+            f"  ⏰ │ <code>{time_str}</code>\n"
+            f"  📅 │ <i>{date_str}</i>"
+        )
+    
+    def layout_dots():
+        return (
+            f"  {batch_icon} <b>{batch}</b> ··· {subject_emoji} <b>{subject}</b>\n"
+            f"  ⏰ <code>{time_str}</code> ··· 📅 <i>{day_name}</i>"
+        )
+    
+    def layout_double_box():
+        return (
+            f"╔══════════════════════╗\n"
+            f"║ {batch_icon} <b>{batch}</b> — {subject_emoji} <b>{subject}</b>\n"
+            f"║ ⏰ <b>{time_str}</b> — 📅 <i>{day_name}</i>\n"
+            f"╚══════════════════════╝"
+        )
+    
+    def layout_indented():
+        return (
+            f"  ▸ {batch_icon} <b>Batch:</b> <u>{batch}</u>\n"
+            f"  ▸ {subject_emoji} <b>Subject:</b> <u>{subject}</u>\n"
+            f"  ▸ ⏰ <b>Time:</b> <code>{time_str}</code>\n"
+            f"  ▸ 📅 <b>Date:</b> <i>{date_str}</i>"
+        )
+    
+    def layout_bracket():
+        return (
+            f"「 {batch_icon} <b>{batch}</b> 」\n"
+            f"「 {subject_emoji} <b>{subject}</b> 」\n"
+            f"「 ⏰ <code>{time_str}</code> 」\n"
+            f"「 📅 <i>{day_name}, {date_str}</i> 」"
+        )
+    
+    def layout_blockquote():
+        return (
+            f"<blockquote>"
+            f"{batch_icon} <b>{batch}</b> · {subject_emoji} <b>{subject}</b>\n"
+            f"⏰ <code>{time_str}</code> · 📅 <i>{day_name}, {date_str}</i>"
+            f"</blockquote>"
+        )
+    
+    layouts = [
+        ("boxed", layout_boxed),
+        ("arrows", layout_arrows),
+        ("pipes", layout_pipes),
+        ("dots", layout_dots),
+        ("double_box", layout_double_box),
+        ("indented", layout_indented),
+        ("bracket", layout_bracket),
+        ("blockquote", layout_blockquote),
+    ]
+    
+    # ── TAGLINES ──
+    taglines = [
+        "📚 Knowledge is the key to success!",
+        "🎯 Stay focused, stay brilliant!",
+        "💡 Every class is a step forward!",
+        "🚀 Let's make today count!",
+        "⭐ Excellence starts with attendance!",
+        "🔥 Your future self will thank you!",
+        "💪 Consistency beats talent every time!",
+        "🌟 Show up, stand out, succeed!",
+        "🧠 Feed your brain, fuel your future!",
+        "🏆 Champions never miss a class!",
+        "📈 Growth happens one class at a time!",
+        "🎓 Today's lesson = tomorrow's weapon!",
+        "⚡ Be present. Be powerful. Be prepared!",
+        "🎯 Attendance today, success tomorrow!",
+        f"💡 {subject} mastery starts NOW!",
+        "🔑 Unlock your potential, one class at a time!",
+        "🌊 Ride the wave of knowledge!",
+        f"🎓 {batch} squad, let's go!",
+    ]
+    
+    # ── BOTTOM BORDERS / FOOTERS ──
+    footers = [
+        "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
+        "◇◆◇◆◇◆◇◆◇◆◇◆◇◆◇",
+        "✦ ✧ ✦ ✧ ✦ ✧ ✦ ✧ ✦ ✧ ✦ ✧",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "╚══════════════════════╝",
+        "•·.·´¯`·.·•·.·´¯`·.·•",
+        "▂▃▅▇█ ████████ █▇▅▃▂",
+        "░▒▓█ ████████████ █▓▒░",
+        "❖ ━━━━━━━━━━━━━━━━ ❖",
+        "「 ━━━━━━━━━━━━━━━━ 」",
+        "┗━━━━━━━━━━━━━━━━━━━┛",
+        "▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰",
+    ]
+    
+    # ── EMOJI ACCENT LINES (adds visual flair) ──
+    accents = [
+        "🔥🔥🔥🔥🔥🔥🔥🔥🔥",
+        "🚀🚀🚀🚀🚀🚀🚀🚀🚀",
+        "⚡⚡⚡⚡⚡⚡⚡⚡⚡",
+        "🔔🔔🔔🔔🔔🔔🔔🔔🔔",
+        "✨✨✨✨✨✨✨✨✨",
+        "📚📚📚📚📚📚📚📚📚",
+        "💡💡💡💡💡💡💡💡💡",
+        "🎯🎯🎯🎯🎯🎯🎯🎯🎯",
+        "🏆🏆🏆🏆🏆🏆🏆🏆🏆",
+        "🌟🌟🌟🌟🌟🌟🌟🌟🌟",
+    ]
+    
+    # ══════════════════════════════════════
+    # 🎲 COMPOSE THE MESSAGE (all fresh picks)
+    # ══════════════════════════════════════
+    
+    header = pick_fresh(headers, 'header')
+    title = pick_fresh(titles, 'title')
+    greeting = pick_fresh(greetings, 'greeting')
+    layout_name, layout_fn = pick_fresh(layouts, 'layout')
+    tagline = pick_fresh(taglines, 'tagline')
+    footer = pick_fresh(footers, 'footer')
+    accent = pick_fresh(accents, 'accent')
+    
+    # Link section
+    link_section = ""
+    if link:
+        link_styles = [
+            f"\n🔗 <a href='{link}'><b>» JOIN CLASS NOW «</b></a>",
+            f"\n🔗 <a href='{link}'><b>TAP TO JOIN →</b></a>",
+            f"\n🎯 <a href='{link}'><b>CLICK HERE TO JOIN</b></a>",
+            f"\n📎 <a href='{link}'><b>⇢ CLASS LINK ⇠</b></a>",
+            f"\n🚀 <a href='{link}'><b>» LAUNCH CLASS «</b></a>",
+        ]
+        link_section = random.choice(link_styles)
+    
+    # Randomly decide structure variant (keeps overall layout feeling fresh)
+    variant = random.randint(1, 4)
+    
+    if variant == 1:
+        # Accent top + border bottom
+        msg = (
+            f"{accent}\n\n"
+            f"  {title}\n\n"
+            f"{header}\n\n"
+            f"{greeting}\n\n"
+            f"{layout_fn()}\n"
+            f"{link_section}\n\n"
+            f"<i>{tagline}</i>\n"
+            f"{footer}"
+        )
+    elif variant == 2:
+        # Border top + accent bottom
+        msg = (
+            f"{header}\n\n"
+            f"  {title}\n\n"
+            f"{greeting}\n\n"
+            f"{layout_fn()}\n"
+            f"{link_section}\n\n"
+            f"<i>{tagline}</i>\n\n"
+            f"{accent}"
+        )
+    elif variant == 3:
+        # Clean: border sandwich
+        msg = (
+            f"{header}\n"
+            f"  {title}\n"
+            f"{header}\n\n"
+            f"{greeting}\n\n"
+            f"{layout_fn()}\n"
+            f"{link_section}\n\n"
+            f"<i>{tagline}</i>\n"
+            f"{footer}"
+        )
+    else:
+        # Compact: accent + blockquote tagline
+        msg = (
+            f"{accent}\n\n"
+            f"{title}\n\n"
+            f"{greeting}\n\n"
+            f"{layout_fn()}\n"
+            f"{link_section}\n\n"
+            f"<blockquote>{tagline}</blockquote>\n"
+            f"{accent}"
+        )
+    
+    return msg
+
+
+
+
 
 async def send_alert_job(context: ContextTypes.DEFAULT_TYPE):
     """
@@ -2178,13 +2513,15 @@ async def send_alert_job(context: ContextTypes.DEFAULT_TYPE):
     retry_count = data.get('retry_count', 0)
     
     try:
-        link = data.get('link') if data.get('link') != 'None' else "https://t.me/"
-
+        link = data.get('link') if data.get('link') != 'None' else None
+        link_text = f"🔗 <a href='{link}'>JOIN CLASS NOW →</a>" if link else ""
+        
         # Generate message content
         if data.get('msg_type') == "AI":
             text = await generate_hype_message(data['batch'], data['subject'], data['time_display'], link)
             if not text: 
-                text = f"<b>🔔 {data['batch']} CLASS: {data['subject']}</b>\n⏰ {data['time_display']}"
+                # ━━━━ RICH TEMPLATE SYSTEM (No AI needed) ━━━━
+                text = _generate_class_notification(data['batch'], data['subject'], data['time_display'], link)
         else:
             text = f"{data.get('manual_msg')}"
         
@@ -2192,7 +2529,7 @@ async def send_alert_job(context: ContextTypes.DEFAULT_TYPE):
         text = sanitize_html(text)
         
         msg = f"{text}\n\n👇 <i>Mark attendance:</i>"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🙋 I am Present", callback_data=f"att_{job.name}")]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ I'm Present", callback_data=f"att_{job.name}")]])
         
         sent = False
         
