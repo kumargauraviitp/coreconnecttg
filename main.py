@@ -4274,40 +4274,73 @@ async def post_init(app):
     # 5 days = 432000 seconds. First ping after 1 hour (3600s) to confirm it works.
     app.job_queue.run_repeating(supabase_keepalive, interval=432000, first=3600)
     
-    # Memory monitor - Alert admin at 70% (358 MB of 512 MB)
+    # Memory monitor - Multi-stage protection against OOM kills
     async def memory_monitor(context):
         try:
             import psutil
+            import gc
             process = psutil.Process()
             mem_mb = process.memory_info().rss / (1024 * 1024)
             mem_percent = (mem_mb / 512) * 100
             
-            if mem_percent >= 70:
-                # Alert all admins
-                admin_list = ADMIN_USERNAMES + DB.get("admins", [])
-                warning_msg = (
-                    f"⚠️ <b>MEMORY WARNING</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"📊 <b>Usage:</b> {mem_mb:.1f} MB / 512 MB ({mem_percent:.1f}%)\n"
-                    f"⏰ <b>Time:</b> {datetime.now(IST).strftime('%H:%M:%S IST')}\n\n"
-                    f"💡 <i>Consider using /manualrestart to free memory</i>"
-                )
-                for admin in admin_list:
-                    if admin:
-                        try:
-                            # Try to get chat ID from username
-                            # This works if admin has started the bot
-                            pass  # We'll log instead since we can't easily get chat ID
-                        except:
-                            pass
-                logger.warning(f"⚠️ Memory at {mem_percent:.1f}% ({mem_mb:.1f} MB)")
+            # ── STAGE 1: Warning at 70% (358 MB) ──
+            if mem_percent >= 70 and mem_percent < 80:
+                logger.warning(f"⚠️ Memory at {mem_percent:.1f}% ({mem_mb:.1f} MB) - monitoring closely")
+            
+            # ── STAGE 2: Aggressive cleanup at 80% (410 MB) ──
+            elif mem_percent >= 80 and mem_percent < 90:
+                logger.warning(f"🔶 Memory HIGH at {mem_percent:.1f}% ({mem_mb:.1f} MB) - running emergency cleanup")
+                
+                # Force garbage collection
+                gc.collect()
+                
+                # Clean old data aggressively
+                cleanup_old_data()
+                
+                # Clear user_data caches from all conversations
+                if hasattr(context, 'application') and context.application:
+                    try:
+                        context.application.user_data.clear()
+                        context.application.chat_data.clear()
+                        logger.info("🧹 Cleared user_data and chat_data caches")
+                    except:
+                        pass
+                
+                # Force another gc pass
+                gc.collect()
+                
+                # Check if cleanup helped
+                mem_after = process.memory_info().rss / (1024 * 1024)
+                logger.info(f"📊 Memory after cleanup: {mem_after:.1f} MB (freed {mem_mb - mem_after:.1f} MB)")
+            
+            # ── STAGE 3: Emergency auto-restart at 90% (460 MB) ──
+            elif mem_percent >= 90:
+                logger.critical(f"🔴 CRITICAL MEMORY: {mem_percent:.1f}% ({mem_mb:.1f} MB) - AUTO-RESTART!")
+                
+                # Save database before restart to prevent data loss
+                try:
+                    if supabase:
+                        supabase.table("bot_storage").upsert({"id": 1, "data": DB}).execute()
+                        logger.info("✅ Emergency DB save completed before auto-restart")
+                except Exception as save_err:
+                    logger.error(f"❌ Emergency save failed: {save_err}")
+                
+                # Graceful exit - Render will auto-restart the process
+                # All scheduled jobs will be restored from Supabase on restart
+                import sys
+                logger.info("🔄 Initiating auto-restart to prevent OOM crash...")
+                await asyncio.sleep(2)  # Give logs time to flush
+                sys.exit(0)
+                
         except ImportError:
             pass  # psutil not installed
+        except SystemExit:
+            raise  # Don't catch sys.exit()
         except Exception as e:
             logger.error(f"Memory monitor error: {e}")
     
-    # Check memory every 5 minutes
-    app.job_queue.run_repeating(memory_monitor, interval=300, first=120)
+    # Check memory every 3 minutes (more frequent for faster response)
+    app.job_queue.run_repeating(memory_monitor, interval=180, first=120)
 
     logger.info("✅ Vasuki Bot initialized successfully")
 
