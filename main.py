@@ -54,7 +54,7 @@ from telegram import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeAllGroupChats,
-    ChatMember,
+    ChatMember,̦
     ChatMemberUpdated
 )
 from telegram.constants import ParseMode, ChatAction
@@ -576,6 +576,11 @@ def home():
     </body>
     </html>
     """
+
+@app.route('/health')
+def health():
+    """Lightweight health check endpoint for uptime monitors"""
+    return 'OK', 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -4219,25 +4224,55 @@ async def post_init(app):
         try:
             import httpx
             port = int(os.environ.get("PORT", 8080))
-            urls = [
-                f"http://127.0.0.1:{port}/",
-                os.environ.get("RENDER_EXTERNAL_URL")  # Critical: External ping!
-            ]
             
-            async with httpx.AsyncClient(timeout=10) as client:
+            # Build URL list: internal + external + health endpoint
+            render_url = os.environ.get("RENDER_EXTERNAL_URL")
+            urls = [f"http://127.0.0.1:{port}/health"]
+            if render_url:
+                # Ping both root and health endpoint externally
+                urls.append(render_url.rstrip('/') + '/health')
+                urls.append(render_url)  # Root endpoint too
+            
+            async with httpx.AsyncClient(timeout=15) as client:
                 for url in urls:
-                    if url:
-                        try:
-                            await client.get(url)
-                            logger.info(f"🔔 Ping sent to {url}")
-                        except Exception as inner_e:
-                            logger.warning(f"⚠️ Ping failed for {url}: {inner_e}")
+                    try:
+                        resp = await client.get(url)
+                        logger.info(f"🔔 Ping OK: {url} ({resp.status_code})")
+                    except Exception as inner_e:
+                        logger.warning(f"⚠️ Ping failed for {url}: {inner_e}")
 
         except Exception as e:
             logger.warning(f"⚠️ Keep-alive mechanism error: {e}")
 
-    # 5 minutes = 300 seconds
+    # 5 minutes = 300 seconds  
     app.job_queue.run_repeating(smart_ping, interval=300, first=60)
+    
+    # ──────────────────────────────────────────────────────────────────────
+    # 🛡️ SUPABASE KEEP-ALIVE (Ping every 5 days to prevent 7-day pause)
+    # ──────────────────────────────────────────────────────────────────────
+    async def supabase_keepalive(context):
+        """Ping Supabase with a lightweight query every 5 days to prevent auto-pause.
+        Supabase free tier pauses after 7 days of inactivity.
+        Running this every 5 days (432000 seconds) keeps it alive."""
+        if not supabase:
+            logger.warning("⚠️ Supabase keepalive skipped - no connection")
+            return
+        try:
+            # Lightweight SELECT to keep the project active
+            response = supabase.table("bot_storage").select("id").eq("id", 1).limit(1).execute()
+            logger.info(f"✅ Supabase keepalive ping successful at {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')} - rows: {len(response.data)}")
+        except Exception as e:
+            logger.error(f"❌ Supabase keepalive ping FAILED: {e}")
+            # Retry after 1 hour if first attempt fails
+            try:
+                await asyncio.sleep(3600)
+                response = supabase.table("bot_storage").select("id").eq("id", 1).limit(1).execute()
+                logger.info(f"✅ Supabase keepalive retry successful")
+            except Exception as retry_e:
+                logger.error(f"❌ Supabase keepalive retry also FAILED: {retry_e}")
+    
+    # 5 days = 432000 seconds. First ping after 1 hour (3600s) to confirm it works.
+    app.job_queue.run_repeating(supabase_keepalive, interval=432000, first=3600)
     
     # Memory monitor - Alert admin at 70% (358 MB of 512 MB)
     async def memory_monitor(context):
