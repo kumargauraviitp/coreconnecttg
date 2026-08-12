@@ -1726,21 +1726,20 @@ async def combined_wizard_finalize(update_obj, context):
     gid = DB["config"]["group_id"]
     if not gid: return ConversationHandler.END
 
-    # Schedule for BOTH batches
-    for batch in ["CSDA", "AICS"]:
-        for dt in dates:
-            run_dt = dt.replace(hour=h, minute=m, second=0)
-            notify_dt = run_dt - timedelta(minutes=d['sch_offset'])
-            job_id = f"{batch}_{int(time.time())}_{count}"
-            job_data = {
-                "batch": batch, "subject": sub, "time_display": t_str, 
-                "link": d['sch_link'], "manual_msg": d.get('sch_manual_msg'),
-                "msg_type": "MANUAL" if d.get('sch_manual_msg') else "AI",
-                "message_thread_id": d.get('sch_topic_id')
-            }
-            context.job_queue.run_once(send_alert_job, notify_dt, chat_id=gid, name=job_id, data=job_data)
-            add_job_to_db(job_id, notify_dt.timestamp(), gid, job_data)
-            count += 1
+    # Schedule a SINGLE message for BOTH batches
+    for dt in dates:
+        run_dt = dt.replace(hour=h, minute=m, second=0)
+        notify_dt = run_dt - timedelta(minutes=d['sch_offset'])
+        job_id = f"COMBINED_{int(time.time())}_{count}"
+        job_data = {
+            "batch": "CSDA & AICS", "subject": sub, "time_display": t_str, 
+            "link": d['sch_link'], "manual_msg": d.get('sch_manual_msg'),
+            "msg_type": "MANUAL" if d.get('sch_manual_msg') else "AI",
+            "message_thread_id": d.get('sch_topic_id')
+        }
+        context.job_queue.run_once(send_alert_job, notify_dt, chat_id=gid, name=job_id, data=job_data)
+        add_job_to_db(job_id, notify_dt.timestamp(), gid, job_data)
+        count += 1
     
     topic_name = DB.get("topics", {}).get(str(d.get('sch_topic_id')), "General") if d.get('sch_topic_id') else "General"
     
