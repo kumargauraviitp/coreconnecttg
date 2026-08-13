@@ -33,7 +33,9 @@ import time
 import traceback
 import html
 import re
-from threading import Thread
+import random
+from collections import deque
+from threading import Thread, Lock, Event
 from datetime import datetime, timedelta, time as dtime
 import pytz
 from flask import Flask
@@ -237,27 +239,126 @@ def load_db():
         logger.error(f"❌ Failed to load DB from Cloud: {e}")
         _ensure_db_shape()
 
-def _save_db_thread():
-    if not supabase: return
-    # Delays in seconds: 1m, 1m, 1m, 5m, 10m
-    delays = [60, 60, 60, 300, 600]
-    
-    for i, delay in enumerate(delays):
-        try:
-            supabase.table("bot_storage").upsert({"id": 1, "data": DB}).execute()
-            logger.info("✅ Database saved to Cloud.")
-            return
-        except Exception as e:
-            logger.error(f"❌ Cloud Save Failed (Attempt {i+1}/{len(delays)}): {e}")
-            logger.info(f"⏳ Retrying in {delay/60} minutes...")
-            time.sleep(delay)
-    
-    # Final attempt or failure
-    logger.error("❌ CLOUD SAVE FAILED after multiple attempts.")
+# ------------------------------------------------------------------------------
+# ☁️ COALESCING CLOUD WRITER
+# ------------------------------------------------------------------------------
+# save_db() is called from 32 places, including mark_attendance — so 60 students
+# tapping "present" used to spawn 60 OS threads, each of which serialised the
+# ENTIRE database and, on failure, slept for up to 18 minutes (60+60+60+300+600).
+# Measured on a 1.4 MB database that cost +116 MB RSS at 60 concurrent threads
+# and +287 MB at 120, which is how a 512 MB Render instance gets OOM-killed.
+#
+# Replaced with ONE long-lived daemon worker plus a dirty flag:
+#   • N calls during a burst collapse into a single write
+#   • only one serialisation exists at any moment, so RSS stays flat
+#   • retries are bounded (~3.5 min, not 18) and abandoned if newer data arrives,
+#     because the next write supersedes the failed one anyway
+#   • daemon thread, so a failing save can't hold up process shutdown
+
+SAVE_DEBOUNCE_SECONDS = 2.0          # let a burst of edits settle into one write
+SAVE_RETRY_DELAYS = (5, 15, 45, 120)  # bounded backoff
+
+_save_dirty = Event()
+_save_worker_lock = Lock()
+_save_worker_thread = None
+_save_stats = {"requested": 0, "written": 0, "coalesced": 0,
+               "failed": 0, "last_error": None, "last_ok": None}
+
+
+def _db_snapshot():
+    """
+    Point-in-time copy of DB for uploading.
+
+    Serialising DB directly would let the asyncio thread mutate it mid-encode
+    ("dictionary changed size during iteration"). One round-trip is far cheaper
+    than the many concurrent encodes this replaces.
+    """
+    return json.loads(json.dumps(DB))
+
+
+def _save_db_blocking():
+    """Single synchronous upload attempt. Returns True, or raises."""
+    if not supabase:
+        return False
+    supabase.table("bot_storage").upsert({"id": 1, "data": _db_snapshot()}).execute()
+    _save_stats["written"] += 1
+    _save_stats["last_ok"] = time.time()
+    return True
+
+
+def _save_worker_loop():
+    """One thread for the whole process lifetime."""
+    while True:
+        _save_dirty.wait()
+        # Collapse a burst: anything that arrives in this window rides along.
+        time.sleep(SAVE_DEBOUNCE_SECONDS)
+        _save_dirty.clear()
+
+        wrote = False
+        for attempt, delay in enumerate((0,) + SAVE_RETRY_DELAYS):
+            if delay:
+                # A newer change is queued — that write covers this one too.
+                if _save_dirty.is_set():
+                    logger.info("☁️ Newer changes queued, skipping retry.")
+                    break
+                time.sleep(delay)
+                if _save_dirty.is_set():
+                    break
+            try:
+                if _save_db_blocking():
+                    logger.info("✅ Database saved to Cloud.")
+                    wrote = True
+                break
+            except Exception as e:
+                _save_stats["last_error"] = str(e)[:200]
+                logger.error(f"❌ Cloud save failed (attempt {attempt + 1}): {e}")
+
+        if not wrote and not _save_dirty.is_set():
+            _save_stats["failed"] += 1
+            logger.error("❌ CLOUD SAVE FAILED — will retry on next change.")
+
 
 def save_db():
-    t = Thread(target=_save_db_thread)
-    t.start()
+    """
+    Request a cloud save. Cheap, non-blocking, and safe to call in a tight loop —
+    concurrent calls coalesce into a single upload.
+    """
+    _save_stats["requested"] += 1
+    if not supabase:
+        return
+    global _save_worker_thread
+    with _save_worker_lock:
+        if _save_worker_thread is None or not _save_worker_thread.is_alive():
+            _save_worker_thread = Thread(target=_save_worker_loop,
+                                         name="db-writer", daemon=True)
+            _save_worker_thread.start()
+    if _save_dirty.is_set():
+        _save_stats["coalesced"] += 1
+    _save_dirty.set()
+
+
+def flush_db_sync(timeout=25):
+    """
+    Force an immediate blocking save. For shutdown and manual /forcesave, where
+    we must not return before the data is durable.
+    """
+    if not supabase:
+        return False
+    last = None
+    for delay in (0, 2, 5):
+        if delay:
+            time.sleep(delay)
+        try:
+            if _save_db_blocking():
+                _save_dirty.clear()
+                logger.info("✅ Database flushed to Cloud.")
+                return True
+        except Exception as e:
+            last = e
+            logger.error(f"❌ Flush attempt failed: {e}")
+    _save_stats["failed"] += 1
+    _save_stats["last_error"] = str(last)[:200] if last else "unknown"
+    return False
 
 async def force_cloud_save(update, context):
     """Manually trigger cloud save with UI feedback"""
@@ -270,20 +371,31 @@ async def force_cloud_save(update, context):
     )
     
     try:
-        # Run sync save in thread but wait for it
+        # Blocking flush off the event loop, so the reply reflects the real result.
+        # The old code awaited the fire-and-forget retry thread and then reported
+        # success unconditionally — even when every attempt had failed.
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _save_db_thread)
-        
-        await msg.edit_text(
-            "✅ <b>CLOUD SAVE SUCCESSFUL!</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "💾 <i>Data has been synced to Supabase.</i>",
-            parse_mode=ParseMode.HTML
-        )
+        saved = await loop.run_in_executor(None, flush_db_sync)
+
+        if saved:
+            await msg.edit_text(
+                "✅ <b>CLOUD SAVE SUCCESSFUL!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "💾 <i>Data has been synced to Supabase.</i>",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await msg.edit_text(
+                f"❌ <b>SAVE FAILED</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"<code>{html.escape(str(_save_stats.get('last_error'))[:180])}</code>\n\n"
+                f"<i>Data is safe in memory and will retry on the next change.</i>",
+                parse_mode=ParseMode.HTML
+            )
     except Exception as e:
         await msg.edit_text(
             f"❌ <b>SAVE FAILED!</b>\n\n"
-            f"<i>Error:</i> {str(e)}",
+            f"<i>Error:</i> <code>{html.escape(str(e)[:180])}</code>",
             parse_mode=ParseMode.HTML
         )
 
@@ -452,8 +564,8 @@ def cleanup_old_data(context=None):
     EDIT_SUB_SELECT_BATCH, EDIT_SUB_SELECT_SUBJECT, EDIT_SUB_ACTION, EDIT_SUB_NEW_NAME,
     RESET_CONFIRM, EDIT_TOPIC_SELECT, EDIT_TOPIC_NEW_NAME, DELETE_TOPIC_CONFIRM,
     EDIT_SELECT_SCOPE, EDIT_BULK_DAYS,
-    COMBINED_SELECT_SUB
-) = range(41)
+    COMBINED_SELECT_SUB, EDIT_MSG_TYPE
+) = range(42)
 
 # Regex to match any menu button for canceling wizards
 MENU_REGEX = "^(📸 AI Auto-Schedule|🧠 Custom AI|🟦 Schedule CSDA|🟧 Schedule AICS|📅 Schedule Classes|📝 Custom Message|➕ Add Subject|📂 More Options|✏️ Edit Class|🗑️ Delete Class|📅 View Schedule|📊 Attendance|📚 All Subjects|📤 Export Data|📥 Import Data|👥 Manage Admins|💬 Manage Topics|🛠️ Admin Tools|🔙 Back to Main|🌙 Night Schedule|☁️ Force Save|🔄 Reset System|🗑️ Remove Topic|➕ Add Topic Manual|📋 List Topics|👤 Add Admin|🗑️ Remove Admin|📋 View Admins)$"
@@ -797,6 +909,222 @@ def is_private_chat(update):
     """Check if the message is from a private chat"""
     return update.effective_chat.type == 'private'
 
+# ------------------------------------------------------------------------------
+# 🎬 FILMY MEME ROASTS FOR NON-ADMINS
+# Every roast is a famous film dialogue with the film credited. Lines are picked
+# at random AND never repeat until the pool is exhausted (tracked per-user), so
+# nobody sees the same dialogue twice in a row. The user's name is stitched in.
+# ------------------------------------------------------------------------------
+
+# Commands every member may use anywhere (group or DM). Everything else is
+# admin-only and gets roasted.
+PUBLIC_COMMANDS = {"feedback", "login", "start"}
+
+# Roasts for DMs — film dialogue, film credit, and the scene caption.
+# Pure meme energy: no "access do / admin bana do" begging lines.
+DENY_ROASTS_PRIVATE = [
+    "🎬 <b>“Tumse na ho payega.”</b>\n<i>— Gangs of Wasseypur</i>\n\n{user} ne try kiya... Sardar Khan ne dekh liya. 😂",
+    "🎬 <b>“Kitne aadmi the?”</b>\n<i>— Sholay</i>\n\nGabbar: kitne aadmi the? Bot: ek hi tha sardar... {user}. 😅",
+    "🎬 <b>“Mogambo khush nahi hua.”</b>\n<i>— Mr. India</i>\n\n{user} ki harkat ke baad mood poora off. 😾",
+    "🎬 <b>“Utha le re Deva, utha le!”</b>\n<i>— Hera Pheri</i>\n\nRaju ki dua aaj {user} ke liye. 🙏",
+    "🎬 <b>“Ye kya kar diya Raju!”</b>\n<i>— Phir Hera Pheri</i>\n\n{user} ne exactly wahi kar diya. 😱",
+    "🎬 <b>“Tareekh pe tareekh, tareekh pe tareekh...”</b>\n<i>— Damini</i>\n\n{user} ki file bhi isi court me atki hai. 📅",
+    "🎬 <b>“Control {user}, control!”</b>\n<i>— Welcome</i>\n\nMajnu bhai bhi hil gaye. 😅",
+    "🎬 <b>“Picture abhi baaki hai mere dost.”</b>\n<i>— Om Shanti Om</i>\n\nPar {user} ka scene director ne cut kar diya. 🍿",
+    "🎬 <b>“Galti se mistake ho gaya.”</b>\n<i>— Andaz Apna Apna</i>\n\n{user} — Amar Prem ka teesra bhai. 😂",
+    "🎬 <b>“Mere paas maa hai.”</b>\n<i>— Deewaar</i>\n\n{user} ke paas... kuch bhi nahi. 😂",
+    "🎬 <b>“Kabhi kabhi lagta hai apun hi bhagwan hai.”</b>\n<i>— Sacred Games</i>\n\n{user} ko bhi aaj aisa hi laga. 😌",
+    "🎬 <b>“Apna time aayega.”</b>\n<i>— Gully Boy</i>\n\n{user} yahi soch ke button dabate rahe. ⏳",
+    "🎬 <b>“Jhukega nahi saala!”</b>\n<i>— Pushpa</i>\n\nBot ne bhi wahi bola, {user}. 💪",
+    "🎬 <b>“Rishte mein to hum tumhare baap lagte hain, naam hai Vasuki.”</b>\n<i>— Shahenshah</i>\n\nBot ka intro sun liya {user}? 🐍",
+    "🎬 <b>“Don ko pakadna mushkil hi nahi, namumkin hai.”</b>\n<i>— Don</i>\n\n{user} ka mission bhi wahi tha. 😎",
+    "🎬 <b>“Our business is our business, none of your business.”</b>\n<i>— Race 3</i>\n\n{user}, isko frame karwa lo. 😌",
+    "🎬 <b>“How's the josh?”</b>\n<i>— Uri: The Surgical Strike</i>\n\n{user}: HIGH SIR! Bot: dheere bhai, dheere. 😅",
+    "🎬 <b>“Aata majhi satakli!”</b>\n<i>— Singham</i>\n\n{user} ke ek click se satak gayi. 😤",
+    "🎬 <b>“Keh diya na, bas keh diya!”</b>\n<i>— Kabhi Khushi Kabhie Gham</i>\n\nBot ne bhi bas keh diya, {user}. 🙅",
+    "🎬 <b>“Kabhi kabhi kuch jeetne ke liye kuch haarna padta hai.”</b>\n<i>— Baazigar</i>\n\nAaj {user} ki turn thi. 🎲",
+    "🎬 <b>“All is well.”</b>\n<i>— 3 Idiots</i>\n\n{user}, dil pe haath rakho aur aage badho. 🤲",
+    "🎬 <b>“Kattappa ne Baahubali ko kyun mara?”</b>\n<i>— Baahubali</i>\n\nAur {user} ne ye button kyun dabaya? Do sawaal, jawab nahi. 🤔",
+    "🎬 <b>“Ek baar jo maine commitment kar di, to main khud ki bhi nahi sunta.”</b>\n<i>— Wanted</i>\n\nBot ki commitment bhi pakki hai, {user}. 🔒",
+    "🎬 <b>“Sattar minute!”</b>\n<i>— Chak De! India</i>\n\n{user}, ghadi dekho — khel khatam. 🏑",
+]
+
+# Roasts for groups — one-line dialogues with the film credited. Always sent
+# silently (disable_notification) and auto-deleted, so nobody gets pinged.
+DENY_ROASTS_GROUP = [
+    "🎬 {user} — <i>“Tumse na ho payega.”</i> <b>(Gangs of Wasseypur)</b>",
+    "🎬 {user} — <i>“Namumkin hai.”</i> <b>(Don)</b>",
+    "🎬 {user} — <i>“Keh diya na, bas keh diya!”</i> <b>(Kabhi Khushi Kabhie Gham)</b>",
+    "🎬 {user} — <i>“Mogambo khush nahi hua.”</i> <b>(Mr. India)</b>",
+    "🎬 {user} — <i>“Utha le re Deva, utha le!”</i> <b>(Hera Pheri)</b>",
+    "🎬 {user} — <i>“Ye kya kar diya Raju!”</i> <b>(Phir Hera Pheri)</b>",
+    "🎬 {user} — <i>“Control, control!”</i> <b>(Welcome)</b>",
+    "🎬 {user} — <i>“Kitne aadmi the?”</i> <b>(Sholay)</b>",
+    "🎬 {user} — <i>“Galti se mistake ho gaya.”</i> <b>(Andaz Apna Apna)</b>",
+    "🎬 {user} — <i>“Mere paas maa hai... tumhare paas?”</i> <b>(Deewaar)</b>",
+    "🎬 {user} — <i>“Tareekh pe tareekh, tareekh pe tareekh...”</i> <b>(Damini)</b>",
+    "🎬 {user} — <i>“Jhukega nahi saala!”</i> <b>(Pushpa)</b>",
+    "🎬 {user} — <i>“Picture abhi baaki hai mere dost.”</i> <b>(Om Shanti Om)</b>",
+    "🎬 {user} — <i>“All is well.”</i> <b>(3 Idiots)</b>",
+    "🎬 {user} — <i>“Aata majhi satakli!”</i> <b>(Singham)</b>",
+    "🎬 {user} — <i>“How's the josh?”</i> <b>(Uri: The Surgical Strike)</b>",
+    "🎬 {user} — <i>“None of your business.”</i> <b>(Race 3)</b>",
+    "🎬 {user} — <i>“Kabhi kabhi lagta hai apun hi bhagwan hai.”</i> <b>(Sacred Games)</b>",
+    "🎬 {user} — <i>“Apna time aayega.”</i> <b>(Gully Boy)</b>",
+    "🎬 {user} — <i>“Kattappa ne Baahubali ko kyun mara?”</i> <b>(Baahubali)</b>",
+]
+
+# Roasts when a normal admin tries a super-admin-only action.
+DENY_ROASTS_SUPER = [
+    "🎬 <b>“Rishte mein to hum tumhare baap lagte hain.”</b>\n<i>— Shahenshah</i>\n\n{user}, seniority ka matlab samjho. 😎",
+    "🎬 <b>“Ek din ka CM ban gaye to poora system badal doge?”</b>\n<i>— Nayak</i>\n\n{user}, itni jaldi bhi kya hai. 😅",
+    "🎬 <b>“Mogambo khush hua...”</b>\n<i>— Mr. India</i>\n\n...phir bhi haan nahi boli, {user}. 😾",
+    "🎬 <b>“Kaun hai ye log, kahan se aate hain?”</b>\n<i>— Andaz Apna Apna</i>\n\n{user} ki entry dekh ke Teja bhi confuse. 😅",
+    "🎬 <b>“Rajya ka faisla raja karta hai.”</b>\n<i>— Baahubali</i>\n\nAur raja abhi busy hai, {user}. 👑",
+    "🎬 <b>“Yahan tak hi, iske aage mat aana.”</b>\n<i>— Sholay</i>\n\nThakur ki lakshman rekha, {user}. 🚧",
+    "🎬 <b>“Bahut na-insaafi hai.”</b>\n<i>— Sholay</i>\n\n{user}, hai na? 😅",
+    "🎬 <b>“Thoda dhyaan idhar bhi.”</b>\n<i>— Hera Pheri</i>\n\n{user}, apni line me raho. 😌",
+]
+
+# Per-user roast history so the same line never repeats back-to-back.
+_ROAST_HISTORY = {}
+# Group spam guard: user+chat -> last roast timestamp
+_ROAST_COOLDOWN = {}
+GROUP_ROAST_COOLDOWN = 25      # seconds before the same user is roasted again
+GROUP_ROAST_TTL = 8            # seconds before the roast self-destructs
+
+def _pick_roast(pool, key):
+    """Random pick that avoids anything used recently for this key."""
+    hist = _ROAST_HISTORY.get(key)
+    if hist is None:
+        hist = deque(maxlen=max(1, len(pool) - 1))
+        # Keep the dict from growing forever on a busy group.
+        if len(_ROAST_HISTORY) > 500:
+            _ROAST_HISTORY.clear()
+        _ROAST_HISTORY[key] = hist
+
+    available = [line for line in pool if line not in hist]
+    if not available:
+        hist.clear()
+        available = list(pool)
+
+    choice = random.choice(available)
+    hist.append(choice)
+    return choice
+
+def user_tag(user):
+    """Clickable mention + @username, safe for HTML parse mode."""
+    if not user:
+        return "<b>Anonymous</b>"
+    name = html.escape(user.first_name or user.username or "Anonymous")
+    tag = f'<a href="tg://user?id={user.id}">{name}</a>'
+    if user.username:
+        tag += f" (@{html.escape(user.username)})"
+    return f"<b>{tag}</b>"
+
+def build_deny_message(user, scope="private"):
+    """
+    Build a personalised, non-repeating film meme for this user.
+    Just the meme — no "contact admin / login karo" footer.
+    """
+    pools = {
+        "private": DENY_ROASTS_PRIVATE,
+        "group": DENY_ROASTS_GROUP,
+        "super": DENY_ROASTS_SUPER,
+    }
+    pool = pools.get(scope, DENY_ROASTS_PRIVATE)
+    uid = getattr(user, "id", 0)
+    return _pick_roast(pool, f"{uid}:{scope}").format(user=user_tag(user))
+
+async def _delete_after(context, chat_id, message_id, delay):
+    """Fire-and-forget cleanup so groups don't fill up with roasts."""
+    try:
+        await asyncio.sleep(delay)
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+async def deny_access(update, context, scope=None):
+    """
+    Single entry point for every "you are not allowed" reply.
+
+    • Private chat  → full roast + how-to-get-access footer, stays in chat.
+    • Group chat    → short roast that mentions the user, then both the roast
+                      and the offending command are deleted. Repeat offenders
+                      inside the cooldown get silently cleaned up instead.
+    • Callback taps → roast shown as a popup alert.
+    """
+    try:
+        user = update.effective_user
+        message = update.effective_message
+
+        # Button/callback taps: popup alert, nothing left in chat.
+        if update.callback_query:
+            plain = re.sub(r"<[^>]+>", "", build_deny_message(user, scope or "private"))
+            try:
+                await update.callback_query.answer(plain[:190], show_alert=True)
+            except Exception:
+                pass
+            return False
+
+        if message is None:
+            return False
+
+        in_group = update.effective_chat.type in ("group", "supergroup")
+        scope = scope or ("group" if in_group else "private")
+
+        if not in_group:
+            await message.reply_text(
+                build_deny_message(user, scope),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+            return False
+
+        # ---- Group: keep it clean and spam-proof ----
+        chat_id = update.effective_chat.id
+        cool_key = (chat_id, user.id if user else 0)
+        now = time.time()
+        recently_roasted = now - _ROAST_COOLDOWN.get(cool_key, 0) < GROUP_ROAST_COOLDOWN
+        _ROAST_COOLDOWN[cool_key] = now
+        if len(_ROAST_COOLDOWN) > 500:
+            for k in [k for k, v in _ROAST_COOLDOWN.items() if now - v > 300]:
+                _ROAST_COOLDOWN.pop(k, None)
+
+        # Remove the command they tried, roast or not.
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        if recently_roasted:
+            return False
+
+        try:
+            sent = await context.bot.send_message(
+                chat_id=chat_id,
+                text=build_deny_message(user, scope),
+                parse_mode=ParseMode.HTML,
+                message_thread_id=getattr(message, "message_thread_id", None),
+                disable_web_page_preview=True,
+                disable_notification=True
+            )
+            asyncio.create_task(_delete_after(context, chat_id, sent.message_id, GROUP_ROAST_TTL))
+        except Exception as e:
+            logger.warning(f"Could not send group roast: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Error in deny_access: {e}")
+        return False
+
+# Rotating filmy nudges for admins who use admin buttons inside a group.
+PRIVATE_ONLY_NUDGES = [
+    "🎬 <b>“Itna sannata kyun hai bhai?”</b>\n<i>— Sholay</i>\n\n{user}, chalo DM me. 📩",
+    "🎬 <b>“Control {user}, control!”</b>\n<i>— Welcome</i>\n\nYe tamasha DM me. 📩",
+    "🎬 <b>“Picture abhi baaki hai mere dost.”</b>\n<i>— Om Shanti Om</i>\n\n{user}, par ye picture DM me chalegi. 🍿",
+    "🎬 <b>“Thoda dhyaan idhar bhi.”</b>\n<i>— Hera Pheri</i>\n\n{user}, DM me aao. 📩",
+]
+
 async def require_private_admin(update, context):
     """
     Check if user is admin AND in private chat.
@@ -806,24 +1134,22 @@ async def require_private_admin(update, context):
         user = update.effective_user
         
         # Check if admin
-        if not is_admin(user.username):
-            await update.message.reply_text(
-                f"⛔ <b>ACCESS DENIED</b>\n\n"
-                f"<i>Na Munna Na Ye Sb Nhi Karte. Jao Pdhai Kro</i>\n\n"
-                f"🔐 <b>Grant Access:</b> Contact @AvadaKedavaaraa\n"
-                f"🔑 <b>Or Login:</b> <code>/login [password]</code>",
-                parse_mode=ParseMode.HTML
-            )
+        if not is_admin(user.username if user else None):
+            await deny_access(update, context)
             return False
         
         # Check if private chat
         if not is_private_chat(update):
-            await update.message.reply_text(
-                "🔒 <b>PRIVATE CHAT ONLY!</b>\n\n"
-                "<i>Malik Bhul Gye Kya? Group Me Nhi Private Me Aao.</i>",
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True
-            )
+            message = update.effective_message
+            if message:
+                nudge = _pick_roast(PRIVATE_ONLY_NUDGES, f"{user.id}:private_only")
+                sent = await message.reply_text(
+                    nudge.format(user=user_tag(user)),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    disable_notification=True   # silent: nobody gets pinged
+                )
+                asyncio.create_task(_delete_after(context, sent.chat_id, sent.message_id, 10))
             return False
         
         return True
@@ -841,11 +1167,7 @@ async def start_add_admin(update, context):
         
         # Only super admins can add other admins
         if not is_super_admin(update.effective_user.username):
-            await update.message.reply_text(
-                "⛔ <b>ACCESS DENIED!</b>\n\n"
-                "<i>Chla JA yha se .......</i>",
-                parse_mode=ParseMode.HTML
-            )
+            await deny_access(update, context, scope="super")
             return ConversationHandler.END
         
         current_admins = DB.get("admins", [])
@@ -911,11 +1233,7 @@ async def start_remove_admin(update, context):
         if not await require_private_admin(update, context): return ConversationHandler.END
         
         if not is_super_admin(update.effective_user.username):
-            await update.message.reply_text(
-                "⛔ <b>ARRE BHAI BHAI BHAI!</b>\n\n"
-                "<i>Ye Kaam Sirf Malik Ka Hai! AAP Apna Dekhiye Pehle! 😆</i>",
-                parse_mode=ParseMode.HTML
-            )
+            await deny_access(update, context, scope="super")
             return ConversationHandler.END
         
         current_admins = DB.get("admins", [])
@@ -1048,7 +1366,7 @@ async def updategroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     # Both ENV and DB admins allowed
     if not is_admin(user.username):
-        # Silently ignore non-admins
+        await deny_access(update, context)
         return
 
     
@@ -1128,14 +1446,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_type = update.effective_chat.type
 
-    # Strict Access Control - non-admins get nothing
+    # Strict Access Control - non-admins get a fresh roast every time
     if not is_admin(user.username):
-        await update.message.reply_text(
-            f"⛔ <b>DEKH BHAI DEKH!</b>\n\n"
-            f"<i>Na Apka NAm List ME na HAi 😂 !</i>\n\n"
-            f"🔐 <b>Access Chahiye?</b> Contact @AvadaKedavaaraa",
-            parse_mode=ParseMode.HTML
-        )
+        await deny_access(update, context)
         return
 
     # GROUP/SUPERGROUP: Link and auto-delete message
@@ -1319,10 +1632,7 @@ async def handle_navigation(update, context):
     try:
         user = update.effective_user
         if not is_admin(user.username):
-            await update.message.reply_text(
-                "⛔ <b>BHOOL JA BHAI!</b>\n<i>Apke Bas Ki Nhi Hai Ye! 😜</i>\nContact @AvadaKedavaaraa",
-                parse_mode="HTML"
-            )
+            await deny_access(update, context)
             return
 
         msg = update.message.text
@@ -1442,7 +1752,7 @@ async def wizard_toggle_days(update, context):
     if query.data == "days_done":
         if not context.user_data.get('sch_days'): return SELECT_DAYS
         await query.edit_message_text(
-            "� <b>START DATE</b>\n"
+            "📅 <b>START DATE</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             "<i>Enter in format:</i> <code>DD-MM-YYYY</code>\n"
             "<i>Or type:</i> <code>Today</code>",
@@ -1465,7 +1775,7 @@ async def wizard_start_date(update, context):
         else: start_dt = datetime.strptime(text, "%d-%m-%Y").replace(tzinfo=IST)
         context.user_data['start_dt'] = start_dt
         await update.message.reply_text(
-            "� <b>END DATE</b>\n"
+            "🏁 <b>END DATE</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             "<i>Enter in format:</i> <code>DD-MM-YYYY</code>\n"
             "<i>Or type:</i> <code>None</code> <i>for one-time class</i>",
@@ -2026,111 +2336,261 @@ async def edit_select_job(update, context):
     kb = [
         [InlineKeyboardButton("⏰ Change Time", callback_data="field_time")],
         [InlineKeyboardButton("📅 Change Date", callback_data="field_date")],
-        [InlineKeyboardButton("🔗 Change Link", callback_data="field_link")]
+        [InlineKeyboardButton("🔗 Change Link", callback_data="field_link")],
+        # Always offered. Previously this only appeared when a manual message
+        # already existed, so an auto-generated class could never be switched
+        # over to custom text.
+        [InlineKeyboardButton("📝 Edit Message", callback_data="field_msg")],
+        [InlineKeyboardButton("💬 Edit Topic", callback_data="field_topic")],
+        [InlineKeyboardButton("🔙 Cancel", callback_data="field_cancel")],
     ]
-    
-    # Add Edit Message option if it's a custom message or manual alert
-    if job_data.get('manual_msg'):
-        kb.append([InlineKeyboardButton("📝 Edit Text", callback_data="field_msg")])
-        
-    # Add Edit Topic option if applicable
-    kb.append([InlineKeyboardButton("💬 Edit Topic", callback_data="field_topic")])
-    
+
+    mode = ("Custom text" if job_data.get('manual_msg')
+            else "Auto-generated")
     await query.edit_message_text(
-        "🔧 <b>WHAT TO EDIT?</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<i>Select what you want to change:</i> 👇",
+        f"🔧 <b>WHAT TO EDIT?</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📖 <b>{html.escape(safe_text(job_data.get('subject'), 'Class'))}</b>\n"
+        f"🕒 {html.escape(_format_time_12h(job_data.get('time_display', '')))}\n"
+        f"✍️ Message: <i>{mode}</i>\n\n"
+        f"<i>Select what you want to change:</i> 👇",
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode=ParseMode.HTML
     )
     return EDIT_CHOOSE_FIELD
 
+# Sentinel meaning "revert this class to auto-generated text". Stored as the
+# pending edit value so the AI path can share the scope-selection step.
+EDIT_MSG_AUTO = "__AUTO__"
+
+
+async def _edit_expired(target, is_query=False):
+    """Wizard state lost (timeout / restart / stale button)."""
+    text = ("⌛ <b>THIS EDIT EXPIRED</b>\n\n"
+            "<i>Open ✏️ Edit Class again to retry.</i>")
+    try:
+        if is_query:
+            await target.edit_message_text(text, parse_mode=ParseMode.HTML)
+        else:
+            await target.reply_text(text, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    return ConversationHandler.END
+
+
+async def _edit_show_scope(context, send, field, new_val):
+    """
+    Render the 'apply to which classes?' step.
+
+    `send` is an awaitable taking (text, reply_markup) so this works from both a
+    plain message (edit_save) and a callback (the AI message path).
+    """
+    original_name = context.user_data.get('edit_job_name')
+    if not original_name:
+        return None
+
+    jobs = context.job_queue.get_jobs_by_name(original_name)
+    if not jobs:
+        await send("❌ <b>CLASS NO LONGER SCHEDULED</b>\n\n"
+                   "<i>It may have already fired or been deleted.</i>", None)
+        return ConversationHandler.END
+
+    job = jobs[0]
+    d = safe_job_data(job)                      # job.data can be None
+    subject = d.get('subject', 'Unknown')
+    batch = d.get('batch', 'Unknown')
+    try:
+        day_name = job.next_t.strftime('%A')
+    except Exception:
+        day_name = "Unknown"
+
+    # Count siblings. safe_job_data is essential here: job_queue.jobs() also
+    # returns internal jobs (e.g. the cleanup job) created with data=None, and
+    # calling .get() on those raised
+    # "'NoneType' object has no attribute 'get'".
+    same_subject, same_day = 0, 0
+    for j in context.job_queue.jobs():
+        jd = safe_job_data(j)
+        if jd.get('subject') == subject and jd.get('batch') == batch:
+            same_subject += 1
+            try:
+                if j.next_t and j.next_t.strftime('%A') == day_name:
+                    same_day += 1
+            except Exception:
+                pass
+
+    if field == "msg":
+        shown = ("Auto-generated" if new_val == EDIT_MSG_AUTO
+                 else f"Custom · {new_val[:24]}…" if len(new_val) > 24
+                 else f"Custom · {new_val}")
+    else:
+        shown = new_val[:30]
+
+    kb = [
+        [InlineKeyboardButton("🎯 This class only", callback_data="scope_single")],
+        [InlineKeyboardButton(f"📅 All {subject[:14]} on {day_name} ({same_day})",
+                              callback_data="scope_day")],
+        [InlineKeyboardButton(f"📚 All {subject[:18]} ({same_subject})",
+                              callback_data="scope_subject")],
+        [InlineKeyboardButton("🔙 Cancel", callback_data="scope_cancel")],
+    ]
+
+    await send(
+        f"✅ <b>APPLY TO WHICH CLASSES?</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📖 Subject: <b>{html.escape(safe_text(subject, 'Unknown'))}</b>\n"
+        f"🎯 Batch: <b>{html.escape(safe_text(batch, 'Unknown'))}</b>\n"
+        f"🔧 Change: <b>{field.upper()}</b> → <code>{html.escape(shown)}</code>\n\n"
+        f"<i>Select scope:</i> 👇",
+        InlineKeyboardMarkup(kb)
+    )
+    return EDIT_SELECT_SCOPE
+
+
 async def edit_choose_field(update, context):
     query = update.callback_query
     await query.answer()
-    
+
     field = query.data.replace("field_", "")
+    if field == "cancel":
+        await query.edit_message_text("❌ Edit cancelled.")
+        return ConversationHandler.END
+
     context.user_data['edit_field'] = field
-    
+
+    # Message editing first asks HOW, mirroring the scheduling wizard.
+    if field == "msg":
+        kb = [
+            [InlineKeyboardButton("✨ AI / Auto-generated", callback_data="editmsg_ai")],
+            [InlineKeyboardButton("✍️ Write it myself", callback_data="editmsg_manual")],
+            [InlineKeyboardButton("🔙 Cancel", callback_data="editmsg_cancel")],
+        ]
+        await query.edit_message_text(
+            "📝 <b>MESSAGE TYPE</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "✨ <b>AI / Auto-generated</b>\n"
+            "<i>A fresh styled notification is built at send time — different "
+            "layout and wording every class.</i>\n\n"
+            "✍️ <b>Write it myself</b>\n"
+            "<i>Your exact text is sent as-is.</i>",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.HTML
+        )
+        return EDIT_MSG_TYPE
+
     prompts = {
-        "time": "⏰ <b>NEW TIME:</b>\n<i>Enter in HH:MM format (24h)</i>",
-        "date": "📅 <b>NEW DATE:</b>\n<i>Enter YYYY-MM-DD</i>",
-        "link": "🔗 <b>NEW LINK:</b>\n<i>Enter the new meeting link</i>",
-        "msg": "📝 <b>NEW MESSAGE TEXT:</b>\n<i>Enter the new content (HTML supported)</i>",
-        "topic": "💬 <b>NEW TOPIC ID:</b>\n<i>Enter Topic ID (0 for General)</i>"
+        "time": "⏰ <b>NEW TIME</b>\n<i>Enter HH:MM (24-hour), e.g. 14:30</i>",
+        "date": "📅 <b>NEW DATE</b>\n<i>Enter YYYY-MM-DD</i>",
+        "link": "🔗 <b>NEW LINK</b>\n<i>Paste the new meeting link</i>",
+        "topic": "💬 <b>NEW TOPIC ID</b>\n<i>Enter Topic ID (0 for General)</i>",
     }
-    
     await query.edit_message_text(
         prompts.get(field, "❓ Enter new value:"),
         parse_mode=ParseMode.HTML
     )
     return EDIT_NEW_VALUE
 
+
+async def edit_msg_type(update, context):
+    """AI vs manual for the message-edit path."""
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.replace("editmsg_", "")
+
+    if choice == "cancel":
+        await query.edit_message_text("❌ Edit cancelled.")
+        return ConversationHandler.END
+
+    if choice == "manual":
+        await query.edit_message_text(
+            "✍️ <b>SEND THE NEW MESSAGE</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "<i>Telegram HTML is supported: </i>"
+            "<code>&lt;b&gt;bold&lt;/b&gt;</code>, "
+            "<code>&lt;i&gt;italic&lt;/i&gt;</code>, "
+            "<code>&lt;a href=\"…\"&gt;link&lt;/a&gt;</code>\n\n"
+            "<i>Or /cancel to abort.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return EDIT_NEW_VALUE
+
+    # AI path needs no text input — go straight to scope selection.
+    context.user_data['edit_new_value'] = EDIT_MSG_AUTO
+
+    async def send(text, markup):
+        await query.edit_message_text(text, reply_markup=markup,
+                                      parse_mode=ParseMode.HTML)
+
+    result = await _edit_show_scope(context, send, "msg", EDIT_MSG_AUTO)
+    if result is None:
+        return await _edit_expired(query, is_query=True)
+    return result
+
 async def edit_save(update, context):
-    """Store new value and show scope selection"""
-    new_val = update.message.text
-    field = context.user_data['edit_field']
-    
-    # Validate input first
+    """Validate the typed value, then show scope selection."""
+    new_val = safe_text(update.message.text, "").strip()
+    field = context.user_data.get('edit_field')
+
+    if not field or not context.user_data.get('edit_job_name'):
+        return await _edit_expired(update.message)
+
     if field == "time":
         try:
             h, m = map(int, new_val.split(":"))
             if not (0 <= h <= 23 and 0 <= m <= 59):
                 raise ValueError
-        except:
-            await update.message.reply_text("❌ <b>INVALID TIME!</b> Use HH:MM (00:00-23:59)", parse_mode=ParseMode.HTML)
+        except Exception:
+            await update.message.reply_text(
+                "❌ <b>INVALID TIME</b>\n<i>Use HH:MM between 00:00 and 23:59.</i>",
+                parse_mode=ParseMode.HTML)
             return EDIT_NEW_VALUE
-            
+
     elif field == "date":
         try:
             datetime.strptime(new_val, "%Y-%m-%d")
-        except:
-            await update.message.reply_text("❌ <b>INVALID DATE!</b> Use YYYY-MM-DD", parse_mode=ParseMode.HTML)
+        except Exception:
+            await update.message.reply_text(
+                "❌ <b>INVALID DATE</b>\n<i>Use YYYY-MM-DD, e.g. 2026-08-20.</i>",
+                parse_mode=ParseMode.HTML)
             return EDIT_NEW_VALUE
-    
+
     elif field == "topic":
-        if not (new_val.isdigit() or new_val == "0"):
-            await update.message.reply_text("❌ <b>INVALID TOPIC ID!</b> Numbers only", parse_mode=ParseMode.HTML)
+        if not new_val.isdigit():
+            await update.message.reply_text(
+                "❌ <b>INVALID TOPIC ID</b>\n<i>Numbers only (0 for General).</i>",
+                parse_mode=ParseMode.HTML)
             return EDIT_NEW_VALUE
-    
-    # Store the new value
+
+    elif field == "msg":
+        if not new_val:
+            await update.message.reply_text(
+                "❌ <b>MESSAGE CANNOT BE EMPTY</b>\n<i>Send some text or /cancel.</i>",
+                parse_mode=ParseMode.HTML)
+            return EDIT_NEW_VALUE
+        # Reject unsupported tags now rather than failing at send time.
+        valid, err = validate_html(new_val)
+        if not valid:
+            await update.message.reply_text(
+                f"❌ <b>UNSUPPORTED HTML</b>\n\n{err}",
+                parse_mode=ParseMode.HTML)
+            return EDIT_NEW_VALUE
+
+    elif field == "link":
+        if not new_val:
+            await update.message.reply_text(
+                "❌ <b>LINK CANNOT BE EMPTY</b>", parse_mode=ParseMode.HTML)
+            return EDIT_NEW_VALUE
+
     context.user_data['edit_new_value'] = new_val
-    
-    # Get job info for scope display
-    original_name = context.user_data['edit_job_name']
-    jobs = context.job_queue.get_jobs_by_name(original_name)
-    if not jobs:
-        await update.message.reply_text("❌ <b>JOB NOT FOUND!</b>", parse_mode=ParseMode.HTML)
-        return ConversationHandler.END
-    
-    job = jobs[0]
-    subject = job.data.get('subject', 'Unknown')
-    batch = job.data.get('batch', 'Unknown')
-    day_name = job.next_t.strftime('%A')
-    
-    # Count matching jobs for display
-    all_jobs = context.job_queue.jobs()
-    same_subject_count = len([j for j in all_jobs if j.data.get('subject') == subject and j.data.get('batch') == batch])
-    same_day_count = len([j for j in all_jobs if j.data.get('subject') == subject and j.data.get('batch') == batch and j.next_t.strftime('%A') == day_name])
-    
-    kb = [
-        [InlineKeyboardButton(f"🎯 This Class Only", callback_data="scope_single")],
-        [InlineKeyboardButton(f"📅 All {subject} on {day_name} ({same_day_count})", callback_data="scope_day")],
-        [InlineKeyboardButton(f"📚 All {subject} ({same_subject_count})", callback_data="scope_subject")],
-        [InlineKeyboardButton("🔙 Cancel", callback_data="scope_cancel")]
-    ]
-    
-    await update.message.reply_text(
-        f"✅ <b>APPLY TO WHICH CLASSES?</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📖 Subject: <b>{subject}</b>\n"
-        f"🎯 Batch: <b>{batch}</b>\n"
-        f"🔧 Change: <b>{field.upper()}</b> → <code>{new_val[:30]}</code>\n\n"
-        f"<i>Select scope:</i> 👇",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode=ParseMode.HTML
-    )
-    return EDIT_SELECT_SCOPE
+
+    async def send(text, markup):
+        await update.message.reply_text(text, reply_markup=markup,
+                                       parse_mode=ParseMode.HTML)
+
+    result = await _edit_show_scope(context, send, field, new_val)
+    if result is None:
+        return await _edit_expired(update.message)
+    return result
 
 async def edit_scope_handler(update, context):
     """Handle scope selection and apply edits"""
@@ -2143,14 +2603,19 @@ async def edit_scope_handler(update, context):
         return ConversationHandler.END
     
     # Get stored edit data
-    field = context.user_data['edit_field']
-    new_val = context.user_data['edit_new_value']
-    original_name = context.user_data['edit_job_name']
-    
+    field = context.user_data.get('edit_field')
+    new_val = context.user_data.get('edit_new_value')
+    original_name = context.user_data.get('edit_job_name')
+    if not field or new_val is None or not original_name:
+        return await _edit_expired(query, is_query=True)
+
     # Get original job for reference
     jobs = context.job_queue.get_jobs_by_name(original_name)
     if not jobs:
-        await query.edit_message_text("❌ <b>JOB NOT FOUND!</b>", parse_mode=ParseMode.HTML)
+        await query.edit_message_text(
+            "❌ <b>CLASS NO LONGER SCHEDULED</b>\n\n"
+            "<i>It may have already fired or been deleted.</i>",
+            parse_mode=ParseMode.HTML)
         return ConversationHandler.END
     
     ref_job = jobs[0]
@@ -2186,14 +2651,17 @@ async def edit_scope_handler(update, context):
     
     # Apply edits to all matching jobs
     edited_count = 0
+    failures = []
     for job in jobs_to_edit:
         try:
-            data = job.data.copy()
+            data = dict(safe_job_data(job))      # never .copy() on a None
             next_t = job.next_t
             chat_id = job.chat_id
             old_name = job.name
-            
-            # Apply the edit
+            # Preserve the original callback. Hard-coding send_alert_job here
+            # silently converted scheduled custom messages into class alerts.
+            callback = getattr(job, "callback", None) or send_alert_job
+
             if field == "time":
                 h, m = map(int, new_val.split(":"))
                 next_t = next_t.replace(hour=h, minute=m)
@@ -2204,34 +2672,67 @@ async def edit_scope_handler(update, context):
             elif field == "link":
                 data['link'] = new_val
             elif field == "msg":
-                data['manual_msg'] = new_val
+                # msg_type is what send_alert_job branches on. Setting only
+                # manual_msg left msg_type == "AI", so the custom text was
+                # generated over and silently ignored.
+                if new_val == EDIT_MSG_AUTO:
+                    data['msg_type'] = "AI"
+                    data['manual_msg'] = None
+                else:
+                    data['msg_type'] = "MANUAL"
+                    data['manual_msg'] = new_val
             elif field == "topic":
                 tid = int(new_val) if new_val != "0" else None
                 data['message_thread_id'] = tid
-            
-            # Reschedule
+
+            # Don't reschedule into the past — it would fire instantly.
+            if next_t <= datetime.now(IST):
+                failures.append(f"{old_name}: new time is in the past")
+                continue
+
             job.schedule_removal()
-            new_job_id = f"{data['batch']}_{int(time.time())}_{edited_count}"
-            context.job_queue.run_once(send_alert_job, next_t, chat_id=chat_id, name=new_job_id, data=data)
-            
-            # Update DB
+            batch_tag = safe_text(data.get('batch'), 'CLASS').replace(' ', '')
+            new_job_id = f"{batch_tag}_{int(time.time())}_{edited_count}"
+            context.job_queue.run_once(callback, next_t, chat_id=chat_id,
+                                       name=new_job_id, data=data)
+
             remove_job_from_db(old_name)
             add_job_to_db(new_job_id, next_t.timestamp(), chat_id, data)
             edited_count += 1
-            
+
         except Exception as e:
-            logger.error(f"Failed to edit job {job.name}: {e}")
+            logger.error(f"Failed to edit job {getattr(job,'name','?')}: {e}",
+                         exc_info=True)
+            failures.append(f"{getattr(job,'name','?')}: {e}")
             continue
-    
-    scope_text = {"single": "this class", "day": f"all {subject} on {ref_day}", "subject": f"all {subject}"}
-    await query.edit_message_text(
-        f"✅ <b>BULK EDIT COMPLETE!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📊 <b>{edited_count}</b> classes updated\n"
-        f"🔧 <b>{field.upper()}</b> → <code>{new_val[:30]}</code>\n"
-        f"📌 Applied to: <i>{scope_text.get(scope, scope)}</i>",
-        parse_mode=ParseMode.HTML
-    )
+
+    if field == "msg":
+        shown = ("Auto-generated (fresh design each time)"
+                 if new_val == EDIT_MSG_AUTO else f"Custom text ({len(new_val)} chars)")
+    else:
+        shown = new_val[:30]
+
+    scope_text = {"single": "this class",
+                  "day": f"all {subject} on {ref_day}",
+                  "subject": f"all {subject}"}
+
+    if edited_count:
+        body = (f"✅ <b>EDIT APPLIED</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📊 <b>{edited_count}</b> class(es) updated\n"
+                f"🔧 <b>{field.upper()}</b> → <code>{html.escape(shown)}</code>\n"
+                f"📌 Scope: <i>{html.escape(scope_text.get(scope, scope))}</i>")
+    else:
+        body = ("⚠️ <b>NOTHING WAS UPDATED</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "<i>No class could be rescheduled.</i>")
+
+    if failures:
+        body += f"\n\n⚠️ <i>{len(failures)} skipped:</i>\n"
+        body += "\n".join(f"• <code>{html.escape(f[:60])}</code>"
+                          for f in failures[:3])
+
+    await query.edit_message_text(body, parse_mode=ParseMode.HTML)
     return ConversationHandler.END
 
 # ==============================================================================
@@ -2248,6 +2749,134 @@ def _format_time_12h(time_str):
         return f"{h12}:{m:02d} {suffix}"
     except Exception:
         return str(time_str)
+
+
+def _vis_width(s):
+    """
+    Display width of a string in monospace cells.
+
+    Emoji and CJK glyphs occupy TWO cells even in a monospace font, so len()
+    is not enough — using it is what makes hand-drawn boxes come out crooked.
+    """
+    import unicodedata
+    w = 0
+    for ch in s:
+        if unicodedata.combining(ch):
+            continue
+        if unicodedata.east_asian_width(ch) in ('W', 'F'):
+            w += 2
+        elif 0x1F300 <= ord(ch) <= 0x1FAFF or 0x2600 <= ord(ch) <= 0x27BF:
+            w += 2          # emoji / dingbats
+        elif ord(ch) == 0xFE0F:
+            continue        # variation selector renders nothing
+        else:
+            w += 1
+    return w
+
+
+def _wrap_to(text, width):
+    """Wrap on words using display width, hard-splitting overlong words."""
+    words, lines, cur = str(text).split(), [], ""
+    for word in words:
+        trial = f"{cur} {word}".strip()
+        if _vis_width(trial) <= width:
+            cur = trial
+            continue
+        if cur:
+            lines.append(cur)
+        while _vis_width(word) > width:
+            cut = ""
+            for ch in word:
+                if _vis_width(cut + ch) > width:
+                    break
+                cut += ch
+            lines.append(cut)
+            word = word[len(cut):]
+        cur = word
+    if cur:
+        lines.append(cur)
+    return lines or [""]
+
+
+# Border character sets: (tl, tr, bl, br, horizontal, vertical)
+BOX_STYLES = {
+    "light":   ("┌", "┐", "└", "┘", "─", "│"),
+    "heavy":   ("┏", "┓", "┗", "┛", "━", "┃"),
+    "double":  ("╔", "╗", "╚", "╝", "═", "║"),
+    "round":   ("╭", "╮", "╰", "╯", "─", "│"),
+    "dashed":  ("┌", "┐", "└", "┘", "╌", "╎"),
+    "block":   ("▛", "▜", "▙", "▟", "▀", "▌"),
+    "ascii":   ("+", "+", "+", "+", "=", "|"),
+    "mixed":   ("╒", "╕", "╘", "╛", "═", "│"),
+}
+
+
+def _box(rows, style="light", title=None, width=None, pad=1, align_title="left"):
+    """
+    Build a monospace box that ACTUALLY lines up, wrapped in <pre>.
+
+    Why <pre>: Telegram renders normal message text in a proportional font, so a
+    hand-drawn border's right edge drifts and looks broken. <pre> is the only
+    Telegram element rendered in a true monospace font, which is what makes
+    every row the same width on every device.
+
+    Two rules for the interior:
+      • No emoji or HTML inside. Emoji are double-width and vary per platform,
+        and Telegram does not render <b> inside <pre>. Emoji go OUTSIDE the box.
+      • Content is width-computed with _vis_width, not len().
+
+    `title` is embedded into the top border, e.g. ╔═ STATISTICS ═══╗
+    """
+    tl, tr, bl, br, h, v = BOX_STYLES.get(style, BOX_STYLES["light"])
+
+    # Only wrap rows that genuinely overflow. _wrap_to() re-joins on single
+    # spaces, which would collapse the column padding built by _kv_rows().
+    limit = (width - pad * 2) if width else 34
+    body = []
+    for r in rows:
+        if not r:
+            body.append("")
+        elif _vis_width(r) <= limit:
+            body.append(r)
+        else:
+            body.extend(_wrap_to(r, limit))
+
+    inner = width - pad * 2 if width else max(
+        [_vis_width(r) for r in body] + [_vis_width(title) + 2 if title else 0]
+    )
+    if title and inner < _vis_width(title) + 2:
+        inner = _vis_width(title) + 2
+    total = inner + pad * 2
+
+    # ── top border, optionally carrying the title ──
+    if title:
+        t = f" {title} "
+        room = total - _vis_width(t)
+        if align_title == "center":
+            left = max(1, room // 2)
+        else:
+            left = 1
+        right = max(1, room - left)
+        top = f"{tl}{h * left}{t}{h * right}{tr}"
+    else:
+        top = f"{tl}{h * total}{tr}"
+
+    out = [top]
+    for r in body:
+        gap = inner - _vis_width(r)
+        out.append(f"{v}{' ' * pad}{r}{' ' * gap}{' ' * pad}{v}")
+    out.append(f"{bl}{h * total}{br}")
+
+    return "<pre>" + html.escape("\n".join(out)) + "</pre>"
+
+
+def _kv_rows(pairs, sep="  "):
+    """Column-aligned 'Label   value' rows for use inside a box."""
+    label_w = max(_vis_width(k) for k, _ in pairs) if pairs else 0
+    rows = []
+    for k, val in pairs:
+        rows.append(f"{k}{' ' * (label_w - _vis_width(k))}{sep}{val}")
+    return rows
 
 
 def _split_subject(subject):
@@ -2312,7 +2941,7 @@ def _generate_class_notification(batch, subject, time_str, link=None):
     # ─── ANTI-REPETITION ───
     if not hasattr(_generate_class_notification, '_history'):
         _generate_class_notification._history = {
-            'design': deque(maxlen=3),
+            'design': deque(maxlen=6),
             'title': deque(maxlen=2),
             'rule': deque(maxlen=8),
             'opener': deque(maxlen=12),
@@ -2360,9 +2989,29 @@ def _generate_class_notification(batch, subject, time_str, link=None):
             sub_icon, accent = ic, ac
             break
 
+    # ─── COLOUR ACCENTS ───
+    # Telegram allows NO colour tag (no <font>, no CSS) — the permitted set is
+    # b/i/u/s, a, code, pre, blockquote, spoiler, tg-emoji. So real colour comes
+    # from only three places, all used here:
+    #   1. emoji glyphs      — genuinely coloured pixels
+    #   2. <code>            — clients render it tinted (usually orange/red) on
+    #                          a shaded background
+    #   3. <a> links         — the one text colour Telegram guarantees (blue)
+    batch_chip = ("🟦" if batch_e.strip() == "CSDA"
+                  else "🟧" if batch_e.strip() == "AICS"
+                  else "🟪")
+
     # ─── LIVE URGENCY (the real engagement hook) ───
     mins = _minutes_until(time_str, now)
     urgency = ""
+    status_chip = "🔵"
+    if mins is not None:
+        if mins <= 2:
+            status_chip = "🔴"
+        elif mins <= 20:
+            status_chip = "🟠"
+        else:
+            status_chip = "🟢"
     if mins is not None:
         if mins <= 0:
             urgency = pick([
@@ -2577,13 +3226,9 @@ def _generate_class_notification(batch, subject, time_str, link=None):
     # is the only way to get columns that actually line up on every device.
     # Keep lines short — <pre> does not wrap on some clients.
     def data_pre():
-        return (
-            "<pre>"
-            f"Time    {time_12h}\n"
-            f"Date    {day_short}, {date_short}\n"
-            f"Batch   {batch_e}"
-            "</pre>"
-        )
+        # Routed through _box so the card is bordered and width-aligned rather
+        # than a bare <pre> with ragged rows.
+        return _box(_kv_rows(_pairs), style=random.choice(["light", "heavy", "round"]))
 
     def data_quote():
         return (
@@ -2606,6 +3251,40 @@ def _generate_class_notification(batch, subject, time_str, link=None):
             f"<b>Date</b>    ·  {day_name}, {date_short}\n"
             f"<b>Batch</b>   ·  {batch_e}"
         )
+
+    def data_chips():
+        """Coloured emoji chips + <code> values — the most colour Telegram allows."""
+        # batch_e is already HTML-escaped; unescaping here would emit a raw '&'
+        # from "CSDA & AICS" and break the parser.
+        return (
+            f"⏰  <code>{time_12h}</code>\n"
+            f"📅  <code>{day_name}, {date_short}</code>\n"
+            f"{batch_chip}  <code>{batch_e}</code>"
+        )
+
+    # ── Box data blocks (perfectly aligned, drawn inside <pre>) ──
+    # Interiors are plain text: emoji are double-width and <b> is not rendered
+    # inside <pre>, so both would break the alignment. Accents live outside.
+    _pairs = [("Time", time_12h),
+              ("Date", f"{day_short}, {date_short}"),
+              ("Batch", html.unescape(batch_e))]
+
+    def box_plain(style):
+        return _box(_kv_rows(_pairs), style=style)
+
+    def box_titled(style, centered=False):
+        t = (code or name).upper()[:22]
+        return _box(_kv_rows(_pairs), style=style, title=t,
+                    align_title="center" if centered else "left")
+
+    def box_full(style):
+        """Subject inside the box too, so the card is self-contained."""
+        rows = _wrap_to(html.unescape(name), 30)
+        if code:
+            rows.append(html.unescape(code))
+        rows.append("")
+        rows.extend(_kv_rows(_pairs))
+        return _box(rows, style=style, width=32)
 
     # ══════════════════════════════════════════════════════════════════
     #  DESIGN SYSTEMS — four genuinely different visual identities
@@ -2667,7 +3346,57 @@ def _generate_class_notification(batch, subject, time_str, link=None):
         parts += ["", f"<blockquote>{flavour}</blockquote>", "", cta]
         return "\n".join(parts)
 
-    design = pick([design_hero, design_editorial, design_ticker, design_brief], 'design')
+    def design_chips():
+        """Maximum colour: status chip, coloured batch chip, tinted <code> values."""
+        parts = [f"{status_chip}  {title()}"]
+        if urgency:
+            parts += ["", urgency]
+        parts += ["", data_chips()]
+        if link_line:
+            parts += ["", link_line]
+        parts += ["", f"<i>{flavour}</i>", "", cta]
+        return "\n".join(parts)
+
+    def design_boxed():
+        """Aligned monospace card with a plain border."""
+        style = random.choice(["light", "heavy", "double", "round", "mixed"])
+        parts = [f"{status_chip}  {title()}"]
+        if urgency:
+            parts += ["", urgency]
+        parts += ["", box_plain(style)]
+        if link_line:
+            parts += ["", link_line]
+        parts += ["", f"<i>{flavour}</i>", "", cta]
+        return "\n".join(parts)
+
+    def design_titled_box():
+        """Subject embedded into the top border: ╔═ STATISTICS ═══╗"""
+        style = random.choice(["double", "heavy", "mixed", "light"])
+        parts = []
+        if urgency:
+            parts += [urgency, ""]
+        parts += [box_titled(style, centered=random.random() < 0.5)]
+        if link_line:
+            parts += ["", link_line]
+        parts += ["", f"{sub_icon}  <b>{name_e}</b>",
+                  f"<i>{flavour}</i>", "", cta]
+        return "\n".join(parts)
+
+    def design_panel():
+        """Self-contained card — everything inside one aligned box."""
+        style = random.choice(["round", "light", "dashed", "block", "ascii"])
+        parts = [box_full(style)]
+        if urgency:
+            parts += ["", urgency]
+        if link_line:
+            parts += ["", link_line]
+        parts += ["", f"<i>{flavour}</i>", "", cta]
+        return "\n".join(parts)
+
+    design = pick([
+        design_hero, design_editorial, design_ticker, design_brief,
+        design_chips, design_boxed, design_titled_box, design_panel,
+    ], 'design')
     return design()
 
 
@@ -2692,14 +3421,23 @@ async def send_alert_job(context: ContextTypes.DEFAULT_TYPE):
         link = data.get('link') if data.get('link') != 'None' else None
         link_text = f"🔗 <a href='{link}'>JOIN CLASS NOW →</a>" if link else ""
         
-        # Generate message content
-        if data.get('msg_type') == "AI":
-            text = await generate_hype_message(data['batch'], data['subject'], data['time_display'], link)
-            if not text: 
+        # Generate message content.
+        # Use .get() throughout: job data edited by older builds may be missing
+        # keys, and a KeyError here would send nothing at all.
+        _batch = data.get('batch', '—')
+        _subject = data.get('subject', 'Class')
+        _time = data.get('time_display', '')
+        manual = data.get('manual_msg')
+
+        if data.get('msg_type') == "AI" or not manual:
+            # Falling back to the generated notification when manual text is
+            # absent. The old code emitted the literal string "None" here.
+            text = await generate_hype_message(_batch, _subject, _time, link)
+            if not text:
                 # ━━━━ RICH TEMPLATE SYSTEM (No AI needed) ━━━━
-                text = _generate_class_notification(data['batch'], data['subject'], data['time_display'], link)
+                text = _generate_class_notification(_batch, _subject, _time, link)
         else:
-            text = f"{data.get('manual_msg')}"
+            text = str(manual)
         
         # Sanitize any forbidden HTML tags
         text = sanitize_html(text)
@@ -3184,7 +3922,9 @@ async def register_topic_command(update, context):
     """Command to register current topic: /topic <name>"""
     try:
         user = update.effective_user
-        if not is_admin(user.username): return
+        if not is_admin(user.username):
+            await deny_access(update, context)
+            return
         
         chat = update.effective_chat
         if not chat.is_forum:
@@ -3620,9 +4360,9 @@ async def send_night_summary(context: ContextTypes.DEFAULT_TYPE):
             if job.name and isinstance(job.data, dict) and 'batch' in job.data:
                 if job.next_t.date() == tomorrow.date():
                     tomorrow_classes.append({
-                        'batch': job.data['batch'],
-                        'subject': job.data['subject'],
-                        'time': job.data['time_display']
+                        'batch': job.data.get('batch', '—'),
+                        'subject': job.data.get('subject', 'Class'),
+                        'time': job.data.get('time_display', '')
                     })
         
         if not tomorrow_classes:
@@ -4213,7 +4953,7 @@ async def start_gemini_tool(update, context):
 
 async def process_gemini_prompt(update, context):
     msg = await update.message.reply_text(
-        "� <b>THINKING...</b>\n\n"
+        "🧠 <b>THINKING...</b>\n\n"
         "⏳ <i>Processing your request...</i>",
         parse_mode=ParseMode.HTML
     )
@@ -4229,7 +4969,9 @@ async def cancelled_command(update, context):
     try:
         user = update.effective_user
         # Require Admin or specific permission? Assuming admin.
-        if not is_admin(user.username): return
+        if not is_admin(user.username):
+            await deny_access(update, context)
+            return
         
         # Delete the trigger message
         try:
@@ -4260,10 +5002,7 @@ async def feedback_handler(update, context):
     
     # In private chat, require admin. In groups, allow anyone.
     if chat_type == 'private' and not is_admin(user.username):
-        await update.message.reply_text(
-            f"⛔ <b>sriman!</b>\n<i>NA aapka naam list me na hai</i>\nContact @AvadaKedavaaraa",
-            parse_mode=ParseMode.HTML
-        )
+        await deny_access(update, context)
         return
 
     msg = update.message.text.replace("/feedback", "").strip()
@@ -4590,7 +5329,7 @@ async def handle_expired(update, context):
     await update.callback_query.answer("⚠️ Expired.", show_alert=True)
 
 # ==============================================================================
-# � RESET / REVOKE COMMAND
+# 🔄 RESET / REVOKE COMMAND
 # ==============================================================================
 async def reset_command(update, context):
     """Manual reset command for admins to fix issues - DOES NOT clear database schedules"""
@@ -5037,6 +5776,7 @@ async def post_init(app):
         BotCommand("resetdatabase", "🧨 Factory Reset"),
         BotCommand("feedback", "💬 Send Feedback"),
         BotCommand("viewattendance", "📊 View Attendance"), # Alias added
+        BotCommand("preview", "👁 Preview Class Alerts"),
     ]
 
     
@@ -5163,8 +5903,11 @@ async def post_init(app):
                 # Save database before restart to prevent data loss
                 try:
                     if supabase:
-                        supabase.table("bot_storage").upsert({"id": 1, "data": DB}).execute()
-                        logger.info("✅ Emergency DB save completed before auto-restart")
+                        loop = asyncio.get_event_loop()
+                        if await loop.run_in_executor(None, flush_db_sync):
+                            logger.info("✅ Emergency DB save completed before auto-restart")
+                        else:
+                            logger.error("❌ Emergency save failed after retries")
                 except Exception as save_err:
                     logger.error(f"❌ Emergency save failed: {save_err}")
                 
@@ -5187,6 +5930,102 @@ async def post_init(app):
 
     logger.info("✅ Vasuki Bot initialized successfully")
 
+def _preview_subjects():
+    """Real subjects from the DB, so previews match what students will see."""
+    _ensure_db_shape()
+    out = []
+    for batch in ("CSDA", "AICS"):
+        for s in DB["subjects"].get(batch, []):
+            out.append((batch, s))
+    # Combined-batch variant, which is how most classes actually go out
+    combined = [("CSDA & AICS", s) for _, s in out]
+    pool = out + combined
+    if not pool:
+        pool = [("CSDA & AICS", "CDA/ACS 201 : Statistics For Data Science")]
+    return pool
+
+
+async def preview_command(update, context):
+    """
+    Send real sample notifications so you can see exactly how Telegram renders
+    them. Nothing is scheduled and no attendance is recorded.
+    """
+    if not await require_private_admin(update, context): return
+
+    import random as _r
+    pool = _preview_subjects()
+    now = datetime.now(IST)
+
+    # Three timing states so the countdown line can be seen in each form
+    offsets = [10, 5, 0]
+    _r.shuffle(offsets)
+
+    await update.message.reply_text(
+        "👁 <b>PREVIEW</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<i>Below is exactly how the next class alerts will appear in the "
+        "group — rendered by Telegram itself, not an approximation.</i>\n\n"
+        "<i>Nothing is scheduled and no attendance is recorded.</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+    for off in offsets:
+        batch, subject = _r.choice(pool)
+        t_str = (now + timedelta(minutes=off)).strftime('%H:%M')
+        text = _generate_class_notification(
+            batch, subject, t_str, "https://meet.google.com/abc-defg-hij")
+        text = sanitize_html(text)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Mark me present", callback_data="previewatt")
+        ]])
+        try:
+            await send_message_safe(
+                context.bot, update.effective_chat.id, safe_text(text),
+                parse_mode=ParseMode.HTML, reply_markup=kb,
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            logger.error(f"Preview send failed: {e}")
+            await update.message.reply_text(
+                f"⚠️ <i>One preview failed to render:</i> "
+                f"<code>{html.escape(str(e)[:120])}</code>",
+                parse_mode=ParseMode.HTML
+            )
+        await asyncio.sleep(0.25)   # stay under Telegram's rate limit
+
+    await update.message.reply_text(
+        "<i>Each alert uses a different design, countdown and wording — "
+        "so consecutive classes never look the same.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Show 3 more", callback_data="preview_more")
+        ]])
+    )
+
+
+async def preview_more_callback(update, context):
+    """Regenerate previews from the inline button."""
+    query = update.callback_query
+    await query.answer("Generating…")
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    # Reuse the command path; it only needs .message and .effective_chat
+    fake = type("U", (), {
+        "message": query.message,
+        "effective_chat": query.message.chat,
+        "effective_user": query.from_user,
+    })()
+    await preview_command(fake, context)
+
+
+async def preview_att_noop(update, context):
+    """The preview's attendance button must never record anything."""
+    await update.callback_query.answer(
+        "👁 Preview only — no attendance recorded.", show_alert=True)
+
+
 async def stats_command(update, context):
     """Show system statistics (memory, uptime) - Admin Private Only"""
     if not await require_private_admin(update, context): return
@@ -5204,14 +6043,40 @@ async def stats_command(update, context):
     except:
         pass
     
+    # Live DB size — the multiplier on every cloud write
+    try:
+        db_kb = len(json.dumps(DB).encode()) / 1024
+        db_str = f"{db_kb/1024:.2f} MB" if db_kb > 1024 else f"{db_kb:.0f} KB"
+    except Exception:
+        db_str = "n/a"
+
+    pct = (mem_mb / 512 * 100) if mem_mb else 0
+    bar_len = 14
+    filled = min(bar_len, int(pct / 100 * bar_len))
+    bar = "█" * filled + "░" * (bar_len - filled)
+
+    req = _save_stats["requested"]
+    written = _save_stats["written"]
+    saved_writes = max(0, req - written)
+
     msg = (
         f"📊 <b>SYSTEM STATISTICS</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🧠 <b>Memory:</b> {mem_mb:.1f} MB\n"
+        f"🧠 <b>Memory:</b> {mem_mb:.1f} MB / 512 MB ({pct:.0f}%)\n"
+        f"<code>{bar}</code>\n\n"
         f"⏱️ <b>Uptime:</b> {uptime_str}\n"
         f"📅 <b>Pending Jobs:</b> {len(DB.get('active_jobs', []))}\n"
-        f"💾 <b>Storage:</b> {'☁️ Supabase' if supabase else '💻 Local'}"
+        f"📦 <b>DB Size:</b> {db_str}\n"
+        f"📋 <b>Attendance Records:</b> {len(DB.get('attendance', {}))}\n"
+        f"💾 <b>Storage:</b> {'☁️ Supabase' if supabase else '💻 Local'}\n\n"
+        f"☁️ <b>CLOUD WRITER</b>\n"
+        f"┣ Requests: <code>{req}</code>\n"
+        f"┣ Actual writes: <code>{written}</code>\n"
+        f"┣ Writes avoided: <code>{saved_writes}</code>\n"
+        f"┗ Failed cycles: <code>{_save_stats['failed']}</code>"
     )
+    if _save_stats["last_error"]:
+        msg += f"\n\n⚠️ <i>Last error:</i> <code>{html.escape(str(_save_stats['last_error'])[:90])}</code>"
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 async def manual_restart_command(update, context):
@@ -5289,6 +6154,68 @@ async def login_command(update, context):
     else:
         await update.message.reply_text("⛔ <b>ACCESS DENIED</b>\nIncorrect password.", parse_mode=ParseMode.HTML)
 
+# ==============================================================================
+# 🚧 CATCH-ALL GUARDS (non-admins poking the bot)
+# ==============================================================================
+def _command_name(message, bot_username=None):
+    """Return the bare command name, or '' if it isn't ours / isn't a command."""
+    text = (message.text or "").strip()
+    if not text.startswith("/"):
+        return ""
+    token = text.split()[0][1:]
+    if "@" in token:
+        name, _, target = token.partition("@")
+        # /cmd@SomeOtherBot is not our business
+        if bot_username and target.lower() != bot_username.lower():
+            return ""
+        return name.lower()
+    return token.lower()
+
+async def guard_unknown_command(update, context):
+    """
+    Last handler for anything command-shaped that no other handler claimed.
+    Non-admins get roasted (and cleaned up in groups); admins get a nudge.
+    """
+    try:
+        message = update.effective_message
+        user = update.effective_user
+        if not message:
+            return
+
+        cmd = _command_name(message, getattr(context.bot, "username", None))
+        if not cmd or cmd in PUBLIC_COMMANDS:
+            return
+
+        if is_admin(user.username if user else None):
+            if is_private_chat(update):
+                await message.reply_text(
+                    "🤔 <b>AISA KOI COMMAND NAHI HAI</b>\n\n"
+                    "<i>/start dabao aur menu se chuno.</i>",
+                    parse_mode=ParseMode.HTML
+                )
+            return
+
+        await deny_access(update, context)
+    except Exception as e:
+        logger.error(f"Error in guard_unknown_command: {e}")
+
+async def guard_non_admin_dm(update, context):
+    """Non-admin sending random text to the bot in DM — roast, rate limited."""
+    try:
+        user = update.effective_user
+        if is_admin(user.username if user else None):
+            return
+
+        key = ("dm", user.id if user else 0)
+        now = time.time()
+        if now - _ROAST_COOLDOWN.get(key, 0) < 12:
+            return
+        _ROAST_COOLDOWN[key] = now
+
+        await deny_access(update, context)
+    except Exception as e:
+        logger.error(f"Error in guard_non_admin_dm: {e}")
+
 def main():
     keep_alive()
     # Reduced connection pool: 8 → 4 (saves ~20-30MB memory)
@@ -5341,6 +6268,10 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^📅 View Schedule"), view_schedule_handler))
     app.add_handler(CallbackQueryHandler(view_schedule_handler, pattern="^schedule_page_"))
     app.add_handler(CallbackQueryHandler(mark_attendance, pattern="^att_"))
+    # Preview: registered before the catch-all so it isn't treated as expired.
+    app.add_handler(CommandHandler("preview", preview_command))
+    app.add_handler(CallbackQueryHandler(preview_more_callback, pattern="^preview_more$"))
+    app.add_handler(CallbackQueryHandler(preview_att_noop, pattern="^previewatt$"))
     app.add_handler(CallbackQueryHandler(verify_topics_callback, pattern="^verify_page_")) # Pagination
 
 
@@ -5361,10 +6292,14 @@ def main():
         states={
             EDIT_SELECT_JOB: [CallbackQueryHandler(edit_select_job, pattern="^edit_")],
             EDIT_CHOOSE_FIELD: [CallbackQueryHandler(edit_choose_field, pattern="^field_")],
+            EDIT_MSG_TYPE: [CallbackQueryHandler(edit_msg_type, pattern="^editmsg_(ai|manual|cancel)$")],
             EDIT_NEW_VALUE: [MessageHandler(txt_filter, edit_save)],
             EDIT_SELECT_SCOPE: [CallbackQueryHandler(edit_scope_handler, pattern="^scope_")]
         },
-        fallbacks=[MessageHandler(filters.Regex(MENU_REGEX), cancel_wizard)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_wizard),
+            MessageHandler(filters.Regex(MENU_REGEX), cancel_wizard),
+        ],
         conversation_timeout=300
     ))
 
@@ -5522,14 +6457,27 @@ def main():
         conversation_timeout=60
     ))
 
+    # ---- Catch-all guards: MUST stay last so real handlers win ----
+    # Any admin-only / unknown command touched by a non-admin gets a meme roast.
+    app.add_handler(MessageHandler(filters.COMMAND, guard_unknown_command))
+    # Non-admins DMing the bot random text also get roasted (rate limited).
+    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, guard_non_admin_dm))
+
     app.add_handler(CallbackQueryHandler(handle_expired))
     
     # Global error handler
     app.add_error_handler(error_handler)
 
     print("✅ VASUKI CLOUD BOT ONLINE")
-    # drop_pending_updates=True prevents conflict with previous instances
-    app.run_polling(drop_pending_updates=True)
+    try:
+        # drop_pending_updates=True prevents conflict with previous instances
+        app.run_polling(drop_pending_updates=True)
+    finally:
+        # The writer is a daemon thread, so any pending change would be lost on
+        # exit. Flush synchronously on the way out.
+        if supabase:
+            logger.info("💾 Flushing database before shutdown...")
+            flush_db_sync()
 
 if __name__ == "__main__":
     main()
