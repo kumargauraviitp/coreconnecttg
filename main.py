@@ -986,6 +986,15 @@ DENY_ROASTS_SUPER = [
     "🎬 <b>“Thoda dhyaan idhar bhi.”</b>\n<i>— Hera Pheri</i>\n\n{user}, apni line me raho. 😌",
 ]
 
+# Footers for DM roasts only: the meme roasts, then this quietly tells them
+# how to actually get in. Rotated so the help line also stays fresh.
+# Group roasts skip this (they auto-delete, and it would just be clutter).
+DENY_FOOTERS = [
+    "🔐 <b>Access chahiye?</b> Contact @AvadaKedavaaraa\n🔑 <b>Password hai?</b> <code>/login [password]</code>",
+    "🙏 <b>Sifarish lagani hai?</b> @AvadaKedavaaraa se baat karo\n🔑 <b>Ya seedha:</b> <code>/login [password]</code>",
+    "📩 <b>Entry chahiye?</b> @AvadaKedavaaraa ko msg karo\n🔑 <b>Password mila hai?</b> <code>/login [password]</code>",
+]
+
 # Per-user roast history so the same line never repeats back-to-back.
 _ROAST_HISTORY = {}
 # Group spam guard: user+chat -> last roast timestamp
@@ -1025,7 +1034,7 @@ def user_tag(user):
 def build_deny_message(user, scope="private"):
     """
     Build a personalised, non-repeating film meme for this user.
-    Just the meme — no "contact admin / login karo" footer.
+    DM roasts get a small footer with how to request access; group roasts don't.
     """
     pools = {
         "private": DENY_ROASTS_PRIVATE,
@@ -1034,7 +1043,13 @@ def build_deny_message(user, scope="private"):
     }
     pool = pools.get(scope, DENY_ROASTS_PRIVATE)
     uid = getattr(user, "id", 0)
-    return _pick_roast(pool, f"{uid}:{scope}").format(user=user_tag(user))
+    text = _pick_roast(pool, f"{uid}:{scope}").format(user=user_tag(user))
+
+    # Group roasts stay bare (they self-delete). DM roasts carry the footer so
+    # the user knows how to actually get access.
+    if scope != "group":
+        text += "\n\n" + _pick_roast(DENY_FOOTERS, f"{uid}:footer")
+    return text
 
 async def _delete_after(context, chat_id, message_id, delay):
     """Fire-and-forget cleanup so groups don't fill up with roasts."""
