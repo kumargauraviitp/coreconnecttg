@@ -220,11 +220,35 @@ SUPABASE_URL=your_url
 SUPABASE_KEY=your_key
 ADMIN_USERNAMES=user1,user2
 GROUP_CHAT_ID=group_id
+OWNER_CHAT_ID=optional
 GEMINI_API_KEY=optional
 ADMIN_PASSWORD=optional
 ```
 
 ⚠ Protect credentials.
+
+**Privilege tiers**
+
+`ADMIN_USERNAMES` are **super admins**. Only they can add or remove admins,
+export or import the database, change the group link, run a factory reset,
+restart the process, or read the feedback inbox.
+
+`ADMIN_PASSWORD` grants the **normal admin** tier through `/login` — scheduling
+and day-to-day operation, nothing that can escalate privilege or exfiltrate the
+database. `/login` works in DM only and is rate limited.
+
+**`OWNER_CHAT_ID`**
+
+Numeric Telegram user ID that receives security alerts and a copy of every
+non-admin interaction (who they are, what they sent, what the bot replied). A
+username can't be used as a delivery target, so if this is unset the bot learns
+the ID the first time a super admin DMs it — meaning you get nothing until then.
+Setting it explicitly is recommended.
+
+**`/auditlog`**
+
+Super-admin command showing the persistent trail of privileged actions: logins,
+admin changes, imports, group relinks, deletions, resets, and denied attempts.
 
 ---
 

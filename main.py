@@ -32,6 +32,8 @@ import io
 import time
 import traceback
 import html
+import hmac
+import base64
 import re
 import random
 from collections import deque
@@ -95,6 +97,16 @@ ADMIN_USERNAMES = [
 ]
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 
+# Owner DM target for security alerts and non-admin activity mirroring.
+# Optional: when unset, the bot learns super-admin chat IDs the first time they
+# DM it (see remember_owner_id) — a username can't be used as a chat_id.
+_raw_owner = os.environ.get("OWNER_CHAT_ID", "").strip()
+try:
+    OWNER_CHAT_ID = int(_raw_owner) if _raw_owner else None
+except ValueError:
+    OWNER_CHAT_ID = None
+    logging.getLogger(__name__).warning("⚠️ OWNER_CHAT_ID is not a number — ignoring.")
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 ENV_GROUP_ID = os.environ.get("GROUP_CHAT_ID")
 
@@ -143,14 +155,64 @@ def get_gemini_model():
     #         logger.error(f"❌ Gemini AI Failed: {e}")
     # return model
 
+# ------------------------------------------------------------------------------
+# 🔑 SUPABASE KEY TIER CHECK
+# ------------------------------------------------------------------------------
+# Which key the bot holds decides who else can reach the database:
+#
+#   service_role / sb_secret_  → bypasses RLS. Correct for a server-side bot, and
+#                                it keeps working after RLS is switched on.
+#   anon / sb_publishable_     → a PUBLIC-BY-DESIGN credential. With RLS disabled
+#                                on the table, anyone holding it can read and
+#                                rewrite bot_storage — including DB["admins"].
+#
+# Detected at boot so the situation is visible in the logs and in /stats instead
+# of being an assumption. Never logs or displays the key itself.
+def _supabase_key_role(key):
+    """Best-effort role behind a Supabase key. Returns None if unrecognised."""
+    if not key:
+        return None
+    k = str(key).strip()
+    if k.startswith("sb_secret_"):
+        return "service_role"
+    if k.startswith("sb_publishable_"):
+        return "anon"
+    parts = k.split(".")
+    if len(parts) == 3:                      # legacy JWT-style key
+        try:
+            payload = parts[1] + "=" * (-len(parts[1]) % 4)
+            return json.loads(base64.urlsafe_b64decode(payload)).get("role")
+        except Exception:
+            return None
+    return None
+
+
+SUPABASE_KEY_ROLE = _supabase_key_role(SUPABASE_KEY)
+SUPABASE_KEY_IS_PUBLIC = SUPABASE_KEY_ROLE == "anon"
+
 # Supabase Connection
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logger.info("✅ Supabase Connected")
+        logger.info(f"✅ Supabase Connected (key role: {SUPABASE_KEY_ROLE or 'unknown'})")
     except Exception as e:
         logger.error(f"❌ Supabase Connection Failed: {e}")
+
+    if SUPABASE_KEY_IS_PUBLIC:
+        logger.critical(
+            "🚨 SUPABASE_KEY is an ANON/PUBLISHABLE key. That key is meant to be "
+            "public, so it cannot be what protects bot_storage. Switch to the "
+            "service_role (sb_secret_) key AND enable RLS on the table — "
+            "otherwise anyone who obtains it can rewrite the admin list."
+        )
+    elif SUPABASE_KEY_ROLE == "service_role":
+        logger.info("🔐 service_role key in use — enabling RLS on bot_storage "
+                    "will not break the bot.")
+    else:
+        logger.warning(f"🔎 Could not identify the Supabase key tier "
+                       f"({SUPABASE_KEY_ROLE or 'unrecognised format'}). Confirm "
+                       f"it is the service_role key and that RLS is enabled.")
 else:
     logger.critical("⚠️ SUPABASE_URL or SUPABASE_KEY missing! Persistence will fail on Render.")
 
@@ -176,7 +238,14 @@ DEFAULT_DB = {
         "classes_scheduled": 0,
         "ai_requests": 0
     },
-    "schedules": [] 
+    "schedules": [],
+    "admins": [],
+    "topics": {},
+    # Security trail for privileged actions (see audit()).
+    "audit_log": [],
+    # Numeric chat IDs of super admins, learned from their DMs, so the bot can
+    # push security alerts and non-admin activity reports without an env var.
+    "owner_ids": []
 }
 
 DB = DEFAULT_DB.copy()
@@ -201,9 +270,20 @@ def _ensure_db_shape():
     for k in ("config", "subjects", "attendance", "system_stats", "topics"):
         if not isinstance(DB.get(k), dict):
             DB[k] = {}
-    for k in ("active_jobs", "feedback", "schedules", "admins"):
+    for k in ("active_jobs", "feedback", "schedules", "admins",
+              "audit_log", "owner_ids"):
         if not isinstance(DB.get(k), list):
             DB[k] = []
+
+    # Admin usernames are the authorisation key, so normalise them once here.
+    # Storing '@Foo' and 'foo' as different entries used to mean a revoked admin
+    # kept access and could not be removed by typing their handle back.
+    DB["admins"] = sorted({
+        str(a).strip().lstrip("@").lower()
+        for a in DB["admins"] if str(a).strip()
+    })
+    DB["owner_ids"] = sorted({int(i) for i in DB["owner_ids"]
+                              if str(i).lstrip("-").isdigit()})
 
     DB["config"].setdefault("group_id", int(ENV_GROUP_ID) if ENV_GROUP_ID else None)
     DB["config"].setdefault("group_name", "❌ No Group Linked")
@@ -751,17 +831,18 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    uptime = int(time.time() - DB["system_stats"]["start_time"])
-    gid = DB["config"]["group_id"]
-    return f"""
+    """
+    Public liveness page. Deliberately says nothing useful.
+
+    This binds to 0.0.0.0 with no authentication, so anyone who finds the URL can
+    read it. It used to publish the linked group ID, the storage backend and the
+    pending job count — free reconnaissance. Uptime monitors only need a 200.
+    """
+    return """
     <html>
     <body style="font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 20px;">
-        <h1>🤖 VASUKI BOT STATUS: <span style="color: #2ea043;">ONLINE</span></h1>
-        <hr>
-        <p><b>Server Time:</b> {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}</p>
-        <p><b>Persistence:</b> {'Supabase ✅' if supabase else 'Local ⚠️'}</p>
-        <p><b>Target Group:</b> {gid}</p>
-        <p><b>Pending Jobs:</b> {len(DB['active_jobs'])}</p>
+        <h1>🤖 VASUKI: <span style="color: #2ea043;">ONLINE</span></h1>
+        <p>Use the bot in Telegram.</p>
     </body>
     </html>
     """
@@ -880,34 +961,292 @@ def days_keyboard(selected_days):
 # ==============================================================================
 # 🛡️ 7. ACCESS CONTROL
 # ==============================================================================
+def _norm_username(username):
+    """
+    Canonical form of a Telegram handle: no '@', no whitespace, lowercase.
+
+    Every comparison in this file goes through here. ADMIN_USERNAMES is
+    lowercased at parse time, so comparing a raw update.effective_user.username
+    against it silently failed for anyone with a capital letter in their handle —
+    which quietly disabled the super-admin gate.
+    """
+    if not username:
+        return ""
+    return str(username).strip().lstrip("@").lower()
+
+
 def is_admin(username):
     """Check if username is an admin (from env or database)"""
-    if not username: return False
-    username = str(username).lower()
-    
-    # Check environment variable admins (already lowercased)
-    if ADMIN_USERNAMES and ADMIN_USERNAMES != ['']:
-        if username in ADMIN_USERNAMES:
-            return True
-    
-    # Check database admins
-    db_admins = [a.lower() for a in DB.get("admins", [])]
-    if username in db_admins:
+    username = _norm_username(username)
+    if not username:
+        return False
+
+    # Environment admins (already normalised at import time)
+    if username in ADMIN_USERNAMES:
         return True
-        
+
+    # Database admins (normalised by _ensure_db_shape)
+    if username in {_norm_username(a) for a in DB.get("admins", [])}:
+        return True
+
     return False
 
 def is_super_admin(username):
-    """Check if username is the primary admin (from env)"""
-    if not username: return False
-    # Strict: explicit list required
-    if ADMIN_USERNAMES and username in ADMIN_USERNAMES:
-        return True
-    return False
+    """Check if username is a primary admin. Env list only — DB admins can
+    never reach this tier, so a leaked /login password cannot escalate."""
+    username = _norm_username(username)
+    if not username:
+        return False
+    return username in ADMIN_USERNAMES
 
 def is_private_chat(update):
     """Check if the message is from a private chat"""
     return update.effective_chat.type == 'private'
+
+# ==============================================================================
+# 🧾 AUDIT TRAIL
+# ==============================================================================
+# Every privileged or security-relevant action lands here, so a takeover can be
+# reconstructed after the fact. Render logs are ephemeral; this survives with the
+# database. Capped, because the whole DB is serialised on every save.
+AUDIT_LOG_MAX = 300
+
+
+def audit(action, user=None, details=None, ok=True):
+    """Append a privileged action to the persistent audit trail."""
+    try:
+        if not isinstance(DB.get("audit_log"), list):
+            DB["audit_log"] = []
+        entry = {
+            "ts": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+            "action": str(action)[:60],
+            "ok": bool(ok),
+            "user_id": getattr(user, "id", None),
+            "username": _norm_username(getattr(user, "username", None)) or None,
+            "name": safe_text(getattr(user, "first_name", None), "") or None,
+            "details": safe_text(details, "")[:300] or None,
+        }
+        DB["audit_log"].append(entry)
+        if len(DB["audit_log"]) > AUDIT_LOG_MAX:
+            del DB["audit_log"][:-AUDIT_LOG_MAX]
+        logger.info("AUDIT %s ok=%s by @%s (%s): %s", entry["action"], entry["ok"],
+                    entry["username"], entry["user_id"], entry["details"])
+        save_db()
+        return entry
+    except Exception as e:
+        logger.error(f"audit() failed for {action}: {e}")
+        return None
+
+# ==============================================================================
+# 📡 OWNER NOTIFICATIONS & NON-ADMIN ACTIVITY MIRROR
+# ==============================================================================
+# A username cannot be used as a chat_id for a private user, so the bot needs a
+# numeric ID to DM the owner. It uses OWNER_CHAT_ID when provided, and otherwise
+# learns it the first time a super admin opens a DM.
+
+def remember_owner_id(user, update=None):
+    """Record a super admin's numeric chat ID so the bot can DM them."""
+    try:
+        if not user or not getattr(user, "id", None):
+            return
+        if not is_super_admin(getattr(user, "username", None)):
+            return
+        if update is not None and not is_private_chat(update):
+            return  # user.id is only a valid DM target once they've opened one
+        ids = DB.setdefault("owner_ids", [])
+        if user.id not in ids:
+            ids.append(user.id)
+            save_db()
+            logger.info(f"📡 Owner DM target learned: {user.id}")
+    except Exception as e:
+        logger.error(f"remember_owner_id failed: {e}")
+
+
+def _owner_targets():
+    """Every chat ID that should receive security alerts / activity reports."""
+    targets = []
+    if OWNER_CHAT_ID:
+        targets.append(OWNER_CHAT_ID)
+    for i in DB.get("owner_ids", []):
+        if i not in targets:
+            targets.append(i)
+    return targets
+
+
+async def notify_owner(context, text):
+    """
+    Best-effort DM to the owner(s). Never raises into the caller.
+
+    Accepts a handler context, an Application, or a raw Bot, so startup checks in
+    post_init can use it too.
+    """
+    bot = getattr(context, "bot", context)
+    targets = _owner_targets()
+    if not targets:
+        logger.warning("📡 No owner DM target set (OWNER_CHAT_ID unset and no "
+                       "super admin has DMed the bot yet).")
+        return
+    for chat_id in targets:
+        try:
+            await send_message_safe(bot, chat_id, safe_text(text),
+                                    parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True)
+        except Exception as e:
+            logger.warning(f"Could not notify owner {chat_id}: {e}")
+
+
+# Flood guard: the owner's DM is subject to Telegram rate limits like any other
+# chat, so a spam burst from a group must not get the bot throttled.
+MIRROR_MAX_PER_WINDOW = 20
+MIRROR_WINDOW = 60
+_mirror_times = deque()
+_mirror_suppressed = 0
+
+
+def _mirror_allowed():
+    """Sliding-window rate check for owner activity reports."""
+    global _mirror_suppressed
+    now = time.time()
+    while _mirror_times and now - _mirror_times[0] > MIRROR_WINDOW:
+        _mirror_times.popleft()
+    if len(_mirror_times) >= MIRROR_MAX_PER_WINDOW:
+        _mirror_suppressed += 1
+        return False
+    _mirror_times.append(now)
+    return True
+
+
+def _plain(text, limit=600):
+    """Strip HTML and escape, so mirrored content can't break the report."""
+    if not text:
+        return ""
+    clean = re.sub(r"<[^>]+>", "", safe_text(text, "")).strip()
+    if len(clean) > limit:
+        clean = clean[:limit] + " …"
+    return html.escape(clean)
+
+
+def _describe_incoming(update):
+    """Human-readable summary of whatever the user just sent."""
+    if update.callback_query:
+        return f"[button tap] {update.callback_query.data}"
+    msg = update.effective_message
+    if not msg:
+        return "[no message]"
+    if msg.text:
+        return msg.text
+    for label in ("photo", "document", "voice", "audio", "video", "sticker",
+                  "animation", "contact", "location", "poll", "video_note"):
+        if getattr(msg, label, None):
+            extra = safe_text(msg.caption, "")
+            return f"[{label}]" + (f" {extra}" if extra else "")
+    return "[non-text message]"
+
+
+async def mirror_non_admin(context, update, bot_reply=None, event=None):
+    """
+    Forward a non-admin interaction to the owner's DM: who they are, what they
+    sent, and what the bot said back. Admins are never mirrored.
+    """
+    global _mirror_suppressed
+    try:
+        user = update.effective_user
+        if is_admin(getattr(user, "username", None)):
+            return
+        if not _owner_targets() or not _mirror_allowed():
+            return
+
+        chat = update.effective_chat
+        if chat and chat.type in ("group", "supergroup"):
+            where = f"👥 {html.escape(safe_text(chat.title, 'Group'))}"
+        else:
+            where = "📩 Direct message"
+
+        uname = _norm_username(getattr(user, "username", None))
+        handle = f"@{html.escape(uname)}" if uname else "<i>no username set</i>"
+
+        lines = [
+            "👁 <b>NON-ADMIN ACTIVITY</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"👤 <b>Username:</b> {handle}",
+            f"🆔 <b>User ID:</b> <code>{getattr(user, 'id', '?')}</code>",
+            f"📛 <b>Name:</b> {html.escape(safe_text(getattr(user, 'first_name', None), '—'))}",
+            f"📍 <b>Where:</b> {where}",
+            f"🕒 <b>Time:</b> {datetime.now(IST).strftime('%d %b %Y, %H:%M:%S IST')}",
+        ]
+        if event:
+            lines.append(f"⚡ <b>Event:</b> {html.escape(str(event))}")
+        lines.append("\n💬 <b>They sent:</b>\n"
+                     f"<blockquote>{_plain(_describe_incoming(update))}</blockquote>")
+        lines.append("\n🤖 <b>Bot replied:</b>\n"
+                     f"<blockquote>{_plain(bot_reply) or '<i>nothing</i>'}</blockquote>")
+
+        if _mirror_suppressed:
+            lines.append(f"\n⚠️ <i>{_mirror_suppressed} earlier event(s) were "
+                         f"dropped by the flood guard.</i>")
+            _mirror_suppressed = 0
+
+        await notify_owner(context, "\n".join(lines))
+    except Exception as e:
+        logger.error(f"mirror_non_admin failed: {e}")
+
+# ==============================================================================
+# 🔒 AUTHORISATION GUARDS
+# ==============================================================================
+
+async def require_super_admin(update, context, action=None):
+    """
+    Private chat + env-listed super admin. Use for anything that can escalate
+    privilege, exfiltrate the database, or take the bot down.
+    """
+    if not await require_private_admin(update, context):
+        return False
+    user = update.effective_user
+    if not is_super_admin(getattr(user, "username", None)):
+        audit(action or "super_admin_denied", user, "not a super admin", ok=False)
+        await deny_access(update, context, scope="super")
+        return False
+    return True
+
+
+async def require_admin_callback(update, context, super_only=False):
+    """
+    Authorise an inline-button tap.
+
+    Callback data is NOT a trusted channel. Telegram hands every client the raw
+    callback_data of any message it can see, and the API lets a client submit an
+    arbitrary data value against that message. A group member who can see the
+    '✅ Mark me present' button on a class alert can just as easily submit
+    'kill_<job_name>' — the job name is right there in the attendance button. So
+    every callback that mutates state must re-authorise the sender instead of
+    assuming the tap came from a menu we drew for an admin.
+    """
+    query = update.callback_query
+    user = update.effective_user
+    username = getattr(user, "username", None)
+    data = getattr(query, "data", "?")
+
+    if not is_admin(username):
+        audit("callback_denied", user, f"data={data}", ok=False)
+        await deny_access(update, context, event=f"forged/unauthorised button: {data}")
+        return False
+
+    if super_only and not is_super_admin(username):
+        audit("callback_denied_super", user, f"data={data}", ok=False)
+        await deny_access(update, context, scope="super")
+        return False
+
+    # Admin keyboards are only ever sent to a DM, so a tap arriving from a group
+    # means the data was submitted by hand.
+    if update.effective_chat and update.effective_chat.type != "private":
+        audit("callback_wrong_chat", user, f"data={data}", ok=False)
+        try:
+            await query.answer("⚠️ Admin actions only work in DM.", show_alert=True)
+        except Exception:
+            pass
+        return False
+
+    return True
 
 # ------------------------------------------------------------------------------
 # 🎬 FILMY MEME ROASTS FOR NON-ADMINS
@@ -1059,7 +1398,7 @@ async def _delete_after(context, chat_id, message_id, delay):
     except Exception:
         pass
 
-async def deny_access(update, context, scope=None):
+async def deny_access(update, context, scope=None, event=None):
     """
     Single entry point for every "you are not allowed" reply.
 
@@ -1068,6 +1407,9 @@ async def deny_access(update, context, scope=None):
                       and the offending command are deleted. Repeat offenders
                       inside the cooldown get silently cleaned up instead.
     • Callback taps → roast shown as a popup alert.
+
+    Every denial is also mirrored to the owner's DM, so you see who tried what
+    and exactly what the bot said back.
     """
     try:
         user = update.effective_user
@@ -1080,6 +1422,8 @@ async def deny_access(update, context, scope=None):
                 await update.callback_query.answer(plain[:190], show_alert=True)
             except Exception:
                 pass
+            await mirror_non_admin(context, update, bot_reply=plain[:190],
+                                   event=event or "denied button tap")
             return False
 
         if message is None:
@@ -1089,11 +1433,14 @@ async def deny_access(update, context, scope=None):
         scope = scope or ("group" if in_group else "private")
 
         if not in_group:
+            reply = build_deny_message(user, scope)
             await message.reply_text(
-                build_deny_message(user, scope),
+                reply,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True
             )
+            await mirror_non_admin(context, update, bot_reply=reply,
+                                   event=event or "access denied (DM)")
             return False
 
         # ---- Group: keep it clean and spam-proof ----
@@ -1113,12 +1460,16 @@ async def deny_access(update, context, scope=None):
             pass
 
         if recently_roasted:
+            await mirror_non_admin(
+                context, update, bot_reply=None,
+                event=event or "access denied in group (reply suppressed by cooldown)")
             return False
 
+        reply = build_deny_message(user, scope)
         try:
             sent = await context.bot.send_message(
                 chat_id=chat_id,
-                text=build_deny_message(user, scope),
+                text=reply,
                 parse_mode=ParseMode.HTML,
                 message_thread_id=getattr(message, "message_thread_id", None),
                 disable_web_page_preview=True,
@@ -1127,6 +1478,8 @@ async def deny_access(update, context, scope=None):
             asyncio.create_task(_delete_after(context, chat_id, sent.message_id, GROUP_ROAST_TTL))
         except Exception as e:
             logger.warning(f"Could not send group roast: {e}")
+        await mirror_non_admin(context, update, bot_reply=reply,
+                               event=event or "access denied (group)")
         return False
     except Exception as e:
         logger.error(f"Error in deny_access: {e}")
@@ -1152,7 +1505,10 @@ async def require_private_admin(update, context):
         if not is_admin(user.username if user else None):
             await deny_access(update, context)
             return False
-        
+
+        # Learn the owner's DM target so security alerts have somewhere to go.
+        remember_owner_id(user, update)
+
         # Check if private chat
         if not is_private_chat(update):
             message = update.effective_message
@@ -1205,28 +1561,33 @@ async def start_add_admin(update, context):
 async def save_new_admin(update, context):
     """Save the new admin username"""
     try:
-        username = update.message.text.strip().replace("@", "")
-        
-        if not username or len(username) < 3:
+        # Normalise before storing: the admin list IS the authorisation key, so
+        # 'Foo' and 'foo' must never be two different entries.
+        username = _norm_username(update.message.text)
+
+        if not re.fullmatch(r"[a-z0-9_]{4,32}", username):
             await update.message.reply_text(
                 "❌ <b>INVALID USERNAME!</b>\n\n"
-                "<i>Username must be at least 3 characters.</i>",
+                "<i>Telegram handles are 4-32 characters, letters, digits and "
+                "underscores only. Send it without the @.</i>",
                 parse_mode=ParseMode.HTML
             )
             return ADD_ADMIN_INPUT
-        
+
         if "admins" not in DB:
             DB["admins"] = []
-        
-        if username in DB["admins"]:
+
+        if is_admin(username):
             await update.message.reply_text(
                 f"⚠️ <b>ALREADY AN ADMIN!</b>\n\n"
-                f"<i>@{username} is already in the admin list.</i>",
+                f"<i>@{html.escape(username)} already has access.</i>",
                 parse_mode=ParseMode.HTML
             )
             return ConversationHandler.END
-        
+
         DB["admins"].append(username)
+        DB["admins"] = sorted(set(DB["admins"]))
+        audit("admin_added", update.effective_user, f"granted @{username}")
         save_db()
         
         await update.message.reply_text(
@@ -1279,17 +1640,30 @@ async def start_remove_admin(update, context):
 async def remove_admin_save(update, context):
     """Remove the admin username"""
     try:
-        username = update.message.text.strip().replace("@", "")
-        
-        if username not in DB.get("admins", []):
+        # Case-insensitive: an admin stored as 'Foo' used to be unremovable by
+        # typing 'foo', silently leaving a revoked admin with full access.
+        username = _norm_username(update.message.text)
+        matches = [a for a in DB.get("admins", []) if _norm_username(a) == username]
+
+        if not matches:
+            if is_super_admin(username):
+                await update.message.reply_text(
+                    f"🔒 <b>CANNOT REMOVE</b>\n\n"
+                    f"<i>@{html.escape(username)} is set in ADMIN_USERNAMES. "
+                    f"Remove them from the environment variable instead.</i>",
+                    parse_mode=ParseMode.HTML
+                )
+                return ConversationHandler.END
             await update.message.reply_text(
                 f"❌ <b>NOT FOUND!</b>\n\n"
-                f"<i>@{username} is not in the admin list.</i>",
+                f"<i>@{html.escape(username)} is not in the admin list.</i>",
                 parse_mode=ParseMode.HTML
             )
             return ConversationHandler.END
-        
-        DB["admins"].remove(username)
+
+        for m in matches:
+            DB["admins"].remove(m)
+        audit("admin_removed", update.effective_user, f"revoked @{username}")
         save_db()
         
         await update.message.reply_text(
@@ -1379,9 +1753,16 @@ async def updategroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
     
-    # Both ENV and DB admins allowed
+    # SUPER ADMINS ONLY. This repoints every pending job at the current chat, so
+    # a password-tier admin who added the bot to their own group could otherwise
+    # divert all class announcements and join links to themselves.
     if not is_admin(user.username):
-        await deny_access(update, context)
+        await deny_access(update, context, event="/updategroup")
+        return
+    if not is_super_admin(user.username):
+        audit("updategroup_denied", user,
+              f"chat={safe_text(chat.title, '?')} ({chat.id})", ok=False)
+        await deny_access(update, context, scope="super")
         return
 
     
@@ -1423,6 +1804,17 @@ async def updategroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             disable_notification=True
         )
     
+    audit("updategroup", user,
+          f"{old_id} → {new_id} ({safe_text(chat.title, '?')}), jobs={updated_jobs}")
+    await notify_owner(
+        context,
+        "📍 <b>GROUP LINK CHANGED</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 {user_tag(user)}\n"
+        f"🆔 <code>{old_id}</code> → <code>{new_id}</code>\n"
+        f"📛 {html.escape(safe_text(chat.title, '?'))}\n"
+        f"🔄 Jobs repointed: <b>{updated_jobs}</b>"
+    )
     logger.info(f"🔄 Group updated: {old_id} → {new_id} ({chat.title})")
 
 # ==============================================================================
@@ -1461,10 +1853,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_type = update.effective_chat.type
 
-    # Strict Access Control - non-admins get a fresh roast every time
+    # Strict Access Control - non-admins get a fresh roast every time, and the
+    # owner gets a DM showing who opened the bot and what it said back.
     if not is_admin(user.username):
-        await deny_access(update, context)
+        await deny_access(update, context, event="opened the bot (/start)")
         return
+
+    # Learn the owner's DM target so activity reports have somewhere to go.
+    remember_owner_id(user, update)
 
     # GROUP/SUPERGROUP: Link and auto-delete message
     if chat_type in ['group', 'supergroup']:
@@ -1553,6 +1949,9 @@ async def verify_topics_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def verify_topics_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle pagination callbacks for verify topics"""
+    # Same class of exposure as handle_kill: global handler, spoofable data.
+    # This one leaks the linked group ID, every topic ID and the job count.
+    if not await require_admin_callback(update, context): return
     query = update.callback_query
     await query.answer()
     
@@ -4409,8 +4808,13 @@ async def send_night_summary(context: ContextTypes.DEFAULT_TYPE):
 # ==============================================================================
 async def export_data(update, context):
     """Export complete database backup"""
-    if not await require_private_admin(update, context): return
-    
+    # The dump contains the admin list, every class link, attendance records and
+    # the feedback table with real user IDs behind the "anonymous" promise. That
+    # is the whole database in one file, so it's super-admin only.
+    if not await require_super_admin(update, context, action="export_denied"): return
+
+    audit("export_data", update.effective_user, "full database dump")
+
     # Ensure all keys exist in export
     export_db = {
         "config": DB.get("config", {"group_id": None, "group_name": "❌ No Group Linked"}),
@@ -4421,7 +4825,8 @@ async def export_data(update, context):
         "system_stats": DB.get("system_stats", {}),
         "schedules": DB.get("schedules", []),
         "admins": DB.get("admins", []),
-        "topics": DB.get("topics", {})
+        "topics": DB.get("topics", {}),
+        "audit_log": DB.get("audit_log", [])
     }
     
     f = io.BytesIO(json.dumps(export_db, indent=2).encode())
@@ -4449,20 +4854,49 @@ async def export_data(update, context):
     )
 
 async def import_request(update, context):
-    if not await require_private_admin(update, context): return
+    # Import rewrites the whole database, so it sits at the same privilege tier
+    # as adding an admin. Otherwise a password-tier admin could upload a file
+    # that hands themselves the admin list and points every job at their chat.
+    if not await require_super_admin(update, context, action="import_request"): return
     await update.message.reply_text(
         "📥 <b>IMPORT DATA</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "⚠️ <b>WARNING:</b> <i>This will OVERWRITE all current data!</i>\n\n"
+        "⚠️ <b>WARNING:</b> <i>This will OVERWRITE classes, subjects, topics, "
+        "attendance and feedback!</i>\n\n"
+        "🔒 <i>Protected — never taken from the file:</i>\n"
+        "┣ 👥 Admin list\n"
+        "┣ 📍 Group link\n"
+        "┗ 🧾 Audit log\n\n"
         "<i>Upload your</i> <code>.json</code> <i>backup file below:</i>",
         parse_mode=ParseMode.HTML
     )
     context.user_data['wait_import'] = True
 
+# Keys an uploaded file is never allowed to set. Everything here either grants
+# privilege or redirects where the bot posts, so it stays under the live config.
+IMPORT_PROTECTED_KEYS = ("admins", "config", "owner_ids", "audit_log")
+
+
 async def handle_import_file(update, context):
     """Import database and restore scheduled jobs"""
-    if not context.user_data.get('wait_import'): return
-    
+    user = update.effective_user
+
+    # Any JSON document sent in DM lands here. Re-authorise rather than trusting
+    # the user_data flag alone: it's the only thing standing between an uploaded
+    # file and a full database overwrite.
+    if not is_super_admin(getattr(user, "username", None)):
+        audit("import_denied", user, "non-super-admin uploaded a JSON file", ok=False)
+        await mirror_non_admin(context, update, bot_reply=None,
+                               event="uploaded a JSON file (ignored)")
+        return
+
+    if not context.user_data.get('wait_import'):
+        await update.message.reply_text(
+            "📥 <i>Tap</i> <b>📥 Import Data</b> <i>first, then send the file.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
     try:
         file = await update.message.document.get_file()
         raw = await file.download_as_bytearray()
@@ -4481,25 +4915,50 @@ async def handle_import_file(update, context):
                 job.schedule_removal()
                 cleared += 1
         
-        # Merge with defaults to ensure all keys exist
+        # Merge with defaults to ensure all keys exist. Protected keys are read
+        # from the LIVE database, never from the file.
         global DB
+        kept = {k: DB.get(k) for k in IMPORT_PROTECTED_KEYS}
+        ignored = [k for k in IMPORT_PROTECTED_KEYS if k in imported_data]
+
         DB = {
-            "config": imported_data.get("config", {"group_id": None, "group_name": "❌ No Group Linked"}),
+            "config": kept.get("config") or {"group_id": None, "group_name": "❌ No Group Linked"},
             "subjects": imported_data.get("subjects", {"CSDA": [], "AICS": []}),
             "active_jobs": imported_data.get("active_jobs", []),
             "attendance": imported_data.get("attendance", {}),
             "feedback": imported_data.get("feedback", []),
             "system_stats": imported_data.get("system_stats", {"start_time": time.time(), "classes_scheduled": 0, "ai_requests": 0}),
             "schedules": imported_data.get("schedules", []),
-            "admins": imported_data.get("admins", []),
-            "topics": imported_data.get("topics", {})
+            "admins": kept.get("admins") or [],
+            "topics": imported_data.get("topics", {}),
+            "audit_log": kept.get("audit_log") or [],
+            "owner_ids": kept.get("owner_ids") or [],
         }
         # A key present but set to null bypasses the defaults above, so coerce
         # types before anything reads the imported shape.
         _ensure_db_shape()
-        
+
+        # Jobs carry their own chat_id, so an uploaded file could redirect every
+        # class alert (and its join link) into a chat the uploader controls.
+        # Force them all onto the linked group.
+        linked_group = DB["config"].get("group_id")
+        redirected = 0
+        clean_jobs = []
+        for job_entry in DB["active_jobs"]:
+            if not isinstance(job_entry, dict) or "name" not in job_entry \
+                    or "timestamp" not in job_entry:
+                continue
+            if linked_group is not None and job_entry.get("chat_id") != linked_group:
+                job_entry["chat_id"] = linked_group
+                redirected += 1
+            clean_jobs.append(job_entry)
+        DB["active_jobs"] = clean_jobs
+
         # Save to cloud
         save_db()
+        audit("import_data", user,
+              f"jobs={len(clean_jobs)} redirected={redirected} "
+              f"ignored_keys={','.join(ignored) or 'none'}")
         
         # Restore jobs from imported data
         restored = 0
@@ -4520,7 +4979,17 @@ async def handle_import_file(update, context):
             except Exception as e:
                 logger.error(f"Failed to restore job: {e}")
                 continue
-        
+
+        if ignored or redirected:
+            await notify_owner(
+                context,
+                "📥 <b>DATABASE IMPORTED</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 {user_tag(user)}\n"
+                f"🔒 Ignored protected keys: <code>{html.escape(', '.join(ignored) or 'none')}</code>\n"
+                f"🔄 Jobs redirected to the linked group: <b>{redirected}</b>"
+            )
+
         await update.message.reply_text(
             "✅ <b>IMPORT SUCCESSFUL!</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -4626,10 +5095,63 @@ def seed_attendance_record(job_name, data):
         logger.error(f"Failed to seed attendance for {job_name}: {e}")
 
 
+# Attendance is the one callback every member may use, which makes it the only
+# unauthenticated write path into the database. Two guards:
+#   • the job ID must belong to a real class (seeded when the alert was sent, or
+#     still live in the job queue) — otherwise arbitrary callback data could
+#     create unbounded keys, each one triggering a full-database upload
+#   • a per-user rate limit, so nobody can pump those uploads in a loop
+ATT_ID_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+ATT_MAX_TAPS = 8
+ATT_WINDOW = 60
+_att_taps = {}
+
+
+def _attendance_rate_ok(user_id):
+    now = time.time()
+    taps = _att_taps.setdefault(user_id, deque(maxlen=ATT_MAX_TAPS))
+    while taps and now - taps[0] > ATT_WINDOW:
+        taps.popleft()
+    if len(taps) >= ATT_MAX_TAPS:
+        return False
+    taps.append(now)
+    if len(_att_taps) > 500:
+        for k in [k for k, v in _att_taps.items()
+                  if not v or now - v[-1] > ATT_WINDOW]:
+            _att_taps.pop(k, None)
+    return True
+
+
+def _is_known_class_id(job_id, context):
+    """True only for a job ID this bot actually created."""
+    if isinstance(DB.get("attendance"), dict) and job_id in DB["attendance"]:
+        return True
+    try:
+        if context.job_queue.get_jobs_by_name(job_id):
+            return True
+    except Exception:
+        pass
+    return any(j.get("name") == job_id for j in DB.get("active_jobs", [])
+               if isinstance(j, dict))
+
+
 async def mark_attendance(update, context):
     query = update.callback_query
     job_id = query.data.replace("att_", "")
     user = query.from_user
+
+    # Rate limit BEFORE validating, so a flood of forged IDs can't fill the audit
+    # log (which would push real entries out of the capped list).
+    if not _attendance_rate_ok(getattr(user, "id", 0)):
+        await query.answer("⏳ Slow down a moment.", show_alert=True)
+        return
+
+    if not ATT_ID_RE.match(job_id) or not _is_known_class_id(job_id, context):
+        logger.warning(f"Rejected attendance for unknown class id {job_id!r} "
+                       f"from {getattr(user, 'id', '?')}")
+        audit("attendance_forged", user, f"unknown class id: {job_id[:60]}", ok=False)
+        await query.answer("⚠️ That class no longer exists.", show_alert=True)
+        return
 
     try:
         if not isinstance(DB.get("attendance"), dict):
@@ -5041,12 +5563,14 @@ async def feedback_handler(update, context):
         save_db()
         
         # Show ANONYMOUS confirmation to user (they think it's anonymous)
-        await update.message.reply_text(
+        confirmation = (
             "✅ <b>ANONYMOUS FEEDBACK SENT!</b>\n\n"
             "<i>Jis Byakti Se aap Sampark Krna Chahte Hai Wo Av So Rhe Hai </i>\n"
-            "<i>Msg 10387447 years me chla jayega 🙏</i>",
-            parse_mode=ParseMode.HTML
+            "<i>Msg 10387447 years me chla jayega 🙏</i>"
         )
+        await update.message.reply_text(confirmation, parse_mode=ParseMode.HTML)
+        await mirror_non_admin(context, update, bot_reply=confirmation,
+                               event="sent /feedback")
         
         # Delete the user's original feedback message from the group
         if chat_type != 'private':
@@ -5063,8 +5587,12 @@ async def feedback_handler(update, context):
         )
 
 async def viewfeedback_handler(update, context):
-    """View all feedback - Admin only, Private chat only"""
-    if not await require_private_admin(update, context): return
+    """View all feedback - Super admin only, private chat only.
+
+    The stored entries carry the sender's ID and handle even though the bot tells
+    them the feedback is anonymous, so this is not something a password-tier
+    admin should be able to read."""
+    if not await require_super_admin(update, context, action="viewfeedback_denied"): return
     
     feedback_list = DB.get("feedback", [])
     
@@ -5204,6 +5732,10 @@ async def show_delete_page(message_or_query, context, valid_jobs=None, edit=Fals
 
 async def handle_kill(update, context):
     """Handle delete class callbacks - single deletion, pagination, and delete all"""
+    # This handler is global, so the tap can come from anyone who can see ANY
+    # message of ours with a keyboard — including the attendance button in the
+    # group, which spells out the job name this callback deletes.
+    if not await require_admin_callback(update, context): return
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -5229,7 +5761,8 @@ async def handle_kill(update, context):
                 j.schedule_removal()
             remove_job_from_db(name)
             count += 1
-        
+
+        audit("delete_all_classes", update.effective_user, f"{count} jobs removed")
         await query.edit_message_text(f"🗑️ <b>DELETED {count} CLASSES!</b>", parse_mode=ParseMode.HTML)
         return
 
@@ -5273,6 +5806,7 @@ async def handle_kill(update, context):
 
 async def delete_scope_handler(update, context):
     """Handle delete scope selection"""
+    if not await require_admin_callback(update, context): return
     query = update.callback_query
     await query.answer()
     scope = query.data.replace("del_scope_", "")
@@ -5315,7 +5849,10 @@ async def delete_scope_handler(update, context):
             j.schedule_removal()
             count += 1
         except: pass
-    
+
+    audit("delete_classes", update.effective_user,
+          f"scope={scope} subject={subject} batch={batch} removed={count}")
+
     await query.edit_message_text(
         f"✅ <b>DELETED {count} CLASSES!</b>\n\n"
         f"Refreshed list below...",
@@ -5381,7 +5918,8 @@ async def reset_command(update, context):
 # ==============================================================================
 async def start_reset_db(update, context):
     """Start the reset database conversation"""
-    if not await require_private_admin(update, context): return ConversationHandler.END
+    if not await require_super_admin(update, context, action="resetdatabase_denied"):
+        return ConversationHandler.END
     
     kb = [
         [InlineKeyboardButton("💣 YES, DELETE EVERYTHING", callback_data="reset_confirm")],
@@ -5405,6 +5943,7 @@ async def start_reset_db(update, context):
 
 async def confirm_reset_db(update, context):
     """Execute the database reset"""
+    if not await require_admin_callback(update, context, super_only=True): return
     query = update.callback_query
     await query.answer()
     
@@ -5418,20 +5957,36 @@ async def confirm_reset_db(update, context):
         
     if query.data == "reset_confirm":
         global DB
-        # Preserve config link
+        # Preserve the group link, the admin list (so nobody gets locked out) and
+        # the audit trail (a wipe must not erase its own record).
         old_config = DB.get("config", DEFAULT_DB["config"])
-        old_admins = DB.get("admins", []) # Preserve admins so they don't get locked out
-        
-        # Reset to default
-        DB = DEFAULT_DB.copy()
+        old_admins = DB.get("admins", [])
+        old_audit = DB.get("audit_log", [])
+        old_owners = DB.get("owner_ids", [])
+
+        # Deep copy: DEFAULT_DB.copy() is shallow, so the reset DB used to share
+        # DEFAULT_DB's nested lists and dicts. Every later mutation then polluted
+        # the defaults for the rest of the process lifetime.
+        DB = json.loads(json.dumps(DEFAULT_DB))
         DB["config"] = old_config
         DB["admins"] = old_admins
-        
+        DB["audit_log"] = old_audit
+        DB["owner_ids"] = old_owners
+        _ensure_db_shape()
+
         # Clear schedules from memory
         for job in context.job_queue.jobs():
             job.schedule_removal()
-            
+
+        audit("reset_database", update.effective_user, "factory reset executed")
         save_db()
+        await notify_owner(
+            context,
+            "💥 <b>DATABASE WIPED</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 {user_tag(update.effective_user)}\n"
+            f"🕒 {datetime.now(IST).strftime('%d %b %Y, %H:%M:%S IST')}"
+        )
         
         await query.edit_message_text(
             "💥 <b>DATABASE WIPED!</b>\n"
@@ -5699,7 +6254,7 @@ async def schedule_command(update, context):
 
 async def export_command(update, context):
     """Quick access to export data"""
-    if not await require_private_admin(update, context): return
+    if not await require_super_admin(update, context, action="export_denied"): return
     await export_data(update, context)
 
 async def subjects_command(update, context):
@@ -5715,8 +6270,13 @@ async def attendance_command(update, context):
 # ==============================================================================
 # ⚠️ GLOBAL ERROR HANDLER
 # ==============================================================================
+# Dedup window for owner error alerts, so a tight failure loop can't spam the DM.
+ERROR_ALERT_COOLDOWN = 300
+_error_alert_seen = {}
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Log errors and notify admins"""
+    """Log errors, alert the owner privately, keep details out of public chats"""
     # Log the full traceback. Logging only str(error) gave messages like
     # "'NoneType' object has no attribute 'get'" with no indication of where.
     logger.error(
@@ -5727,9 +6287,46 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         if context.error else "(no traceback)"
     )
     
+    error_msg = safe_text(context.error, "Unknown error")
+
+    # Push the detail to the owner instead of the chat, deduplicated so a
+    # repeating failure can't flood the DM.
+    try:
+        sig = error_msg[:120]
+        now = time.time()
+        if now - _error_alert_seen.get(sig, 0) > ERROR_ALERT_COOLDOWN:
+            _error_alert_seen[sig] = now
+            if len(_error_alert_seen) > 200:
+                _error_alert_seen.clear()
+            await notify_owner(
+                context,
+                "🐞 <b>BOT ERROR</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"<code>{html.escape(error_msg[:400])}</code>"
+            )
+    except Exception as e:
+        logger.error(f"Could not alert owner about error: {e}")
+
     # Try to notify the user if possible
     if update and hasattr(update, 'effective_message') and update.effective_message:
-        error_msg = safe_text(context.error, "Unknown error")
+        # Exception text routinely embeds the Supabase project URL, table names
+        # and request internals. Only an admin in a DM sees the detail; everyone
+        # else gets a generic line, and groups get nothing at all.
+        user = getattr(update, "effective_user", None)
+        chat = getattr(update, "effective_chat", None)
+        in_private = bool(chat and chat.type == "private")
+        detail_ok = in_private and is_admin(getattr(user, "username", None))
+
+        if not detail_ok:
+            if in_private:
+                try:
+                    await update.effective_message.reply_text(
+                        "⚠️ <i>Something went wrong. Try again later.</i>",
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+            return
 
         if "Conflict" in error_msg:
             notice = (
@@ -5766,6 +6363,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ==============================================================================
 async def post_init(app):
     # Group commands - feedback + updategroup for admins
+    # Deliberately NOT advertising /login here: it takes a plaintext password and
+    # must never be typed into a group.
     group_commands = [
         BotCommand("feedback", "💬 Send Feedback to Vasuki Bot"),
         BotCommand("updategroup", "🔄 Update Group Link (Admin)"),
@@ -5792,6 +6391,7 @@ async def post_init(app):
         BotCommand("feedback", "💬 Send Feedback"),
         BotCommand("viewattendance", "📊 View Attendance"), # Alias added
         BotCommand("preview", "👁 Preview Class Alerts"),
+        BotCommand("auditlog", "🧾 Security Audit Log"),
     ]
 
     
@@ -5807,6 +6407,22 @@ async def post_init(app):
         scope=BotCommandScopeAllGroupChats()
     )
     
+    # A public-tier database key is a standing takeover risk, so say so on every
+    # boot until it's fixed rather than burying it in the logs.
+    if SUPABASE_KEY_IS_PUBLIC:
+        await notify_owner(
+            app,
+            "🚨 <b>SUPABASE KEY IS PUBLIC-TIER</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "<code>SUPABASE_KEY</code> <i>is an anon/publishable key. That key is "
+            "designed to be handed out publicly, so it can't be the thing "
+            "protecting</i> <code>bot_storage</code>.\n\n"
+            "<i>With RLS off, anyone holding it can rewrite the database — "
+            "including the admin list.</i>\n\n"
+            "🔧 <b>Fix:</b> switch <code>SUPABASE_KEY</code> to the "
+            "<b>service_role</b> key, then enable RLS on the table."
+        )
+
     # Restore scheduled jobs from database
     await restore_jobs(app)
     cleanup_old_data()
@@ -6083,7 +6699,9 @@ async def stats_command(update, context):
         f"📅 <b>Pending Jobs:</b> {len(DB.get('active_jobs', []))}\n"
         f"📦 <b>DB Size:</b> {db_str}\n"
         f"📋 <b>Attendance Records:</b> {len(DB.get('attendance', {}))}\n"
-        f"💾 <b>Storage:</b> {'☁️ Supabase' if supabase else '💻 Local'}\n\n"
+        f"💾 <b>Storage:</b> {'☁️ Supabase' if supabase else '💻 Local'}\n"
+        f"🔑 <b>DB key tier:</b> "
+        f"{'🚨 anon/public — SWITCH TO service_role' if SUPABASE_KEY_IS_PUBLIC else html.escape(SUPABASE_KEY_ROLE or 'unknown')}\n\n"
         f"☁️ <b>CLOUD WRITER</b>\n"
         f"┣ Requests: <code>{req}</code>\n"
         f"┣ Actual writes: <code>{written}</code>\n"
@@ -6096,7 +6714,9 @@ async def stats_command(update, context):
 
 async def manual_restart_command(update, context):
     """Admin command to safely restart the bot - preserves all schedules"""
-    if not await require_private_admin(update, context): return
+    # Kills the process (Render restarts it), so this is a downtime switch.
+    if not await require_super_admin(update, context, action="restart_denied"): return
+    audit("manual_restart", update.effective_user, "process exit requested")
     
     await update.message.reply_text(
         "🔄 <b>MANUAL RESTART</b>\n"
@@ -6134,40 +6754,234 @@ async def manual_restart_command(update, context):
     import sys
     sys.exit(0)
 
+async def auditlog_command(update, context):
+    """Show the security audit trail - super admin, private chat only."""
+    if not await require_super_admin(update, context, action="auditlog_denied"): return
+
+    entries = DB.get("audit_log", [])
+    if not entries:
+        await update.message.reply_text(
+            "🧾 <b>AUDIT LOG EMPTY</b>\n\n"
+            "<i>No privileged actions recorded yet.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    # Optional count argument: /auditlog 40
+    limit = 20
+    if context.args:
+        try:
+            limit = max(1, min(80, int(context.args[0])))
+        except ValueError:
+            pass
+
+    recent = entries[-limit:][::-1]
+    msg = ["🧾 <b>SECURITY AUDIT LOG</b>", "━" * 24, ""]
+    for e in recent:
+        if not isinstance(e, dict):
+            continue
+        mark = "✅" if e.get("ok", True) else "⛔"
+        who = e.get("username")
+        who = f"@{html.escape(who)}" if who else "<i>no handle</i>"
+        msg.append(
+            f"{mark} <b>{html.escape(safe_text(e.get('action'), '?'))}</b>\n"
+            f"   🕒 {html.escape(safe_text(e.get('ts'), '?'))}\n"
+            f"   👤 {who} · <code>{html.escape(str(e.get('user_id')))}</code>"
+            + (f"\n   📝 <i>{html.escape(safe_text(e.get('details'), ''))}</i>"
+               if e.get("details") else "")
+        )
+        msg.append("")
+    msg.append("━" * 24)
+    msg.append(f"<i>Showing {len(recent)} of {len(entries)} entries "
+               f"(kept: last {AUDIT_LOG_MAX}).</i>")
+
+    await send_message_safe(context.bot, update.effective_chat.id,
+                            safe_text("\n".join(msg)),
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True)
+
+# ------------------------------------------------------------------------------
+# 🔑 LOGIN THROTTLE
+# ------------------------------------------------------------------------------
+# /login used to be an unthrottled password oracle: a single account could try
+# ADMIN_PASSWORD as fast as Telegram allowed, forever, with nothing logged. Now
+# every failure is counted per user, a burst locks the account out, and the owner
+# is told. State is in-memory on purpose — a restart costs an attacker more than
+# it costs us, and it keeps brute-force noise out of the database.
+LOGIN_MAX_FAILS = 5          # failures allowed inside the window
+LOGIN_FAIL_WINDOW = 900      # 15 minutes
+LOGIN_LOCKOUT = 3600         # 1 hour lockout once tripped
+_login_fails = {}            # user_id -> deque of failure timestamps
+_login_locked = {}           # user_id -> unix ts the lockout expires
+
+
+def _login_lock_remaining(user_id):
+    """Seconds left on this user's lockout, or 0."""
+    until = _login_locked.get(user_id, 0)
+    remaining = int(until - time.time())
+    if remaining <= 0:
+        _login_locked.pop(user_id, None)
+        return 0
+    return remaining
+
+
+def _record_login_failure(user_id):
+    """Count a failure. Returns True if this one triggered a lockout."""
+    now = time.time()
+    fails = _login_fails.setdefault(user_id, deque(maxlen=LOGIN_MAX_FAILS * 2))
+    while fails and now - fails[0] > LOGIN_FAIL_WINDOW:
+        fails.popleft()
+    fails.append(now)
+    if len(_login_fails) > 500:      # keep the dict from growing unbounded
+        for k in [k for k, v in _login_fails.items()
+                  if not v or now - v[-1] > LOGIN_FAIL_WINDOW]:
+            _login_fails.pop(k, None)
+    if len(fails) >= LOGIN_MAX_FAILS:
+        _login_locked[user_id] = now + LOGIN_LOCKOUT
+        fails.clear()
+        return True
+    return False
+
+
 async def login_command(update, context):
-    """Allow users to gain admin access via password"""
+    """Allow users to gain admin access via password. Private chat only."""
     user = update.effective_user
     args = context.args
-    
+    uid = getattr(user, "id", 0)
+
+    # The password is plaintext in the message. In a group that publishes it to
+    # every member and to the chat history, so refuse and scrub it.
+    if not is_private_chat(update):
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        audit("login_in_group", user, "attempted /login in a group", ok=False)
+        await notify_owner(
+            context,
+            "🚨 <b>SECURITY: /login USED IN A GROUP</b>\n"
+            f"👤 {user_tag(user)}\n"
+            f"📍 {html.escape(safe_text(update.effective_chat.title, 'group'))}\n\n"
+            "<i>The message was deleted, but anyone watching the chat may have "
+            "seen the password. Rotate ADMIN_PASSWORD.</i>"
+        )
+        try:
+            await context.bot.send_message(
+                uid,
+                "⚠️ <b>NEVER SEND /login IN A GROUP</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "<i>Your message was deleted, but the password may already be "
+                "compromised. Use</i> <code>/login [password]</code> <i>here in "
+                "DM only.</i>",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+        return
+
     if not ADMIN_PASSWORD:
         await update.message.reply_text("❌ <b>LOGIN DISABLED</b>\nNo password configured in settings.", parse_mode=ParseMode.HTML)
+        return
+
+    if is_admin(getattr(user, "username", None)):
+        await update.message.reply_text(
+            "✅ <b>ALREADY LOGGED IN</b>\n\n<i>Type /start.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    locked = _login_lock_remaining(uid)
+    if locked:
+        reply = (
+            "🚫 <b>TOO MANY ATTEMPTS</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<i>Locked for {locked // 60} min {locked % 60} sec.</i>"
+        )
+        await update.message.reply_text(reply, parse_mode=ParseMode.HTML)
+        await mirror_non_admin(context, update, bot_reply=reply,
+                               event="/login while locked out")
         return
 
     if not args:
         await update.message.reply_text("🔑 <b>ADMIN LOGIN</b>\n\nUsage: <code>/login [password]</code>", parse_mode=ParseMode.HTML)
         return
-        
-    password = args[0]
-    if password == ADMIN_PASSWORD:
-        if "admins" not in DB: DB["admins"] = []
-        username = user.username
-        
-        # Check if already admin
-        db_admins = [a.lower() for a in DB["admins"]]
-        if username and username.lower() not in db_admins:
+
+    # compare_digest instead of '==' so the comparison doesn't short-circuit on
+    # the first wrong byte.
+    if hmac.compare_digest(str(args[0]), str(ADMIN_PASSWORD)):
+        _login_fails.pop(uid, None)
+        _login_locked.pop(uid, None)
+
+        username = _norm_username(getattr(user, "username", None))
+        if not username:
+            # Authorisation is keyed on the handle, so a user without one cannot
+            # be granted (or later revoked) reliably.
+            audit("login_no_username", user, "correct password, no @username", ok=False)
+            await update.message.reply_text(
+                "⚠️ <b>SET A USERNAME FIRST</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "<i>Admin access is tied to your @username. Set one in Telegram "
+                "settings, then run /login again.</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        if username not in DB.setdefault("admins", []):
             DB["admins"].append(username)
+            DB["admins"] = sorted(set(DB["admins"]))
             save_db()
-            
+
+        audit("login_success", user, "granted admin via password")
+        await notify_owner(
+            context,
+            "🔓 <b>NEW ADMIN VIA /login</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 {user_tag(user)}\n"
+            f"🆔 <code>{uid}</code>\n"
+            f"🕒 {datetime.now(IST).strftime('%d %b %Y, %H:%M:%S IST')}\n\n"
+            "<i>Remove them with 🗑️ Remove Admin if this wasn't expected.</i>"
+        )
+
         await update.message.reply_text(
             "✅ <b>ACCESS GRANTED!</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"👤 <b>Welcome, {user.first_name}!</b>\n"
+            f"👤 <b>Welcome, {html.escape(safe_text(user.first_name, 'admin'))}!</b>\n"
             "<i>You are now an authenticated admin.</i>\n\n"
             "🚀 <b>TYPE /start TO BEGIN!</b>",
             parse_mode=ParseMode.HTML
         )
+        return
+
+    # ---- Wrong password ----
+    tripped = _record_login_failure(uid)
+    audit("login_failed", user, "incorrect password", ok=False)
+
+    if tripped:
+        reply = (
+            "🚫 <b>TOO MANY FAILED ATTEMPTS</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<i>Locked out for {LOGIN_LOCKOUT // 60} minutes.</i>"
+        )
+        await notify_owner(
+            context,
+            "🚨 <b>BRUTE FORCE ON /login</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 {user_tag(user)}\n"
+            f"🆔 <code>{uid}</code>\n"
+            f"❌ {LOGIN_MAX_FAILS} failed attempts — locked out for "
+            f"{LOGIN_LOCKOUT // 60} min.\n\n"
+            "<i>Consider rotating ADMIN_PASSWORD.</i>"
+        )
     else:
-        await update.message.reply_text("⛔ <b>ACCESS DENIED</b>\nIncorrect password.", parse_mode=ParseMode.HTML)
+        left = LOGIN_MAX_FAILS - len(_login_fails.get(uid, []))
+        reply = (
+            "⛔ <b>ACCESS DENIED</b>\n"
+            f"<i>Incorrect password. {left} attempt(s) left.</i>"
+        )
+
+    await update.message.reply_text(reply, parse_mode=ParseMode.HTML)
+    await mirror_non_admin(context, update, bot_reply=reply,
+                           event="failed /login attempt")
 
 # ==============================================================================
 # 🚧 CATCH-ALL GUARDS (non-admins poking the bot)
@@ -6198,7 +7012,11 @@ async def guard_unknown_command(update, context):
             return
 
         cmd = _command_name(message, getattr(context.bot, "username", None))
-        if not cmd or cmd in PUBLIC_COMMANDS:
+        if not cmd:
+            return
+
+        if cmd in PUBLIC_COMMANDS:
+            # Claimed by a real handler elsewhere; nothing to report here.
             return
 
         if is_admin(user.username if user else None):
@@ -6210,7 +7028,7 @@ async def guard_unknown_command(update, context):
                 )
             return
 
-        await deny_access(update, context)
+        await deny_access(update, context, event=f"tried /{cmd}")
     except Exception as e:
         logger.error(f"Error in guard_unknown_command: {e}")
 
@@ -6224,12 +7042,34 @@ async def guard_non_admin_dm(update, context):
         key = ("dm", user.id if user else 0)
         now = time.time()
         if now - _ROAST_COOLDOWN.get(key, 0) < 12:
+            # Reply is suppressed to avoid spamming them, but the owner still
+            # gets to see everything a non-admin sends.
+            await mirror_non_admin(
+                context, update, bot_reply=None,
+                event="DM to the bot (no reply — roast cooldown)")
             return
         _ROAST_COOLDOWN[key] = now
 
-        await deny_access(update, context)
+        await deny_access(update, context, event="DM to the bot")
     except Exception as e:
         logger.error(f"Error in guard_non_admin_dm: {e}")
+
+
+async def guard_non_admin_media(update, context):
+    """
+    Non-text DM (photo, document, voice, sticker...) from a non-admin.
+
+    Without this, media from a non-admin hit no handler at all: no reply, and
+    nothing reported to the owner.
+    """
+    try:
+        user = update.effective_user
+        if is_admin(user.username if user else None):
+            return
+        await mirror_non_admin(context, update, bot_reply=None,
+                              event="sent media to the bot (ignored)")
+    except Exception as e:
+        logger.error(f"Error in guard_non_admin_media: {e}")
 
 def main():
     keep_alive()
@@ -6246,6 +7086,7 @@ def main():
     app.add_handler(CommandHandler("refresh", refresh_db_command))  # Live DB refresh
     app.add_handler(CommandHandler("manualrestart", manual_restart_command))  # Safe restart
     app.add_handler(CommandHandler("stats", stats_command))  # Memory stats
+    app.add_handler(CommandHandler("auditlog", auditlog_command))  # Security trail
     app.add_handler(CommandHandler("updategroup", updategroup_command))  # Fix group ID issues
     app.add_handler(MessageHandler(filters.Regex("^🔄 Reset System"), reset_command)) # Added button handler
 
@@ -6477,6 +7318,11 @@ def main():
     app.add_handler(MessageHandler(filters.COMMAND, guard_unknown_command))
     # Non-admins DMing the bot random text also get roasted (rate limited).
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, guard_non_admin_dm))
+    # Anything else a non-admin DMs (media, stickers, files) is reported to the
+    # owner rather than silently dropped.
+    app.add_handler(MessageHandler(
+        filters.ChatType.PRIVATE & ~filters.TEXT & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+        guard_non_admin_media))
 
     app.add_handler(CallbackQueryHandler(handle_expired))
     
