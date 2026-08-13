@@ -534,6 +534,21 @@ load_db()
 # ------------------------------------------------------------------------------
 # 🔄 JOB PERSISTENCE HELPERS
 # ------------------------------------------------------------------------------
+def job_tag(text, fallback="CLASS"):
+    """
+    Squeeze arbitrary text into the [A-Za-z0-9_] alphabet used by job IDs.
+
+    Job names end up inside the attendance button's callback_data, and the
+    handler validates that data against a strict character class. A batch like
+    "CSDA & AICS" (or anything Gemini invents during an image scan) used to
+    produce an ID with '&' or '/' in it, which the validator then rejected —
+    the tap came back as "that class no longer exists". Normalising at creation
+    keeps IDs and validation in agreement.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "", str(text or ""))
+    return cleaned[:24] or fallback
+
+
 def add_job_to_db(job_name, run_timestamp, chat_id, data):
     job_entry = {
         "name": job_name,
@@ -1249,107 +1264,79 @@ async def require_admin_callback(update, context, super_only=False):
     return True
 
 # ------------------------------------------------------------------------------
-# 🎬 FILMY MEME ROASTS FOR NON-ADMINS
-# Every roast is a famous film dialogue with the film credited. Lines are picked
-# at random AND never repeat until the pool is exhausted (tracked per-user), so
-# nobody sees the same dialogue twice in a row. The user's name is stitched in.
+# 🔒 ACCESS-DENIED REPLIES
+# One calm, useful line instead of a joke: what is restricted, and what the
+# member can actually do about it. Lines rotate per user so a second attempt
+# does not read like a stuck error. The user's name is stitched in.
 # ------------------------------------------------------------------------------
 
 # Commands every member may use anywhere (group or DM). Everything else is
-# admin-only and gets roasted.
+# admin-only.
 PUBLIC_COMMANDS = {"feedback", "login", "start"}
 
-# Roasts for DMs — film dialogue, film credit, and the scene caption.
-# Pure meme energy: no "access do / admin bana do" begging lines.
-DENY_ROASTS_PRIVATE = [
-    "🎬 <b>“Tumse na ho payega.”</b>\n<i>— Gangs of Wasseypur</i>\n\n{user} ne try kiya... Sardar Khan ne dekh liya. 😂",
-    "🎬 <b>“Kitne aadmi the?”</b>\n<i>— Sholay</i>\n\nGabbar: kitne aadmi the? Bot: ek hi tha sardar... {user}. 😅",
-    "🎬 <b>“Mogambo khush nahi hua.”</b>\n<i>— Mr. India</i>\n\n{user} ki harkat ke baad mood poora off. 😾",
-    "🎬 <b>“Utha le re Deva, utha le!”</b>\n<i>— Hera Pheri</i>\n\nRaju ki dua aaj {user} ke liye. 🙏",
-    "🎬 <b>“Ye kya kar diya Raju!”</b>\n<i>— Phir Hera Pheri</i>\n\n{user} ne exactly wahi kar diya. 😱",
-    "🎬 <b>“Tareekh pe tareekh, tareekh pe tareekh...”</b>\n<i>— Damini</i>\n\n{user} ki file bhi isi court me atki hai. 📅",
-    "🎬 <b>“Control {user}, control!”</b>\n<i>— Welcome</i>\n\nMajnu bhai bhi hil gaye. 😅",
-    "🎬 <b>“Picture abhi baaki hai mere dost.”</b>\n<i>— Om Shanti Om</i>\n\nPar {user} ka scene director ne cut kar diya. 🍿",
-    "🎬 <b>“Galti se mistake ho gaya.”</b>\n<i>— Andaz Apna Apna</i>\n\n{user} — Amar Prem ka teesra bhai. 😂",
-    "🎬 <b>“Mere paas maa hai.”</b>\n<i>— Deewaar</i>\n\n{user} ke paas... kuch bhi nahi. 😂",
-    "🎬 <b>“Kabhi kabhi lagta hai apun hi bhagwan hai.”</b>\n<i>— Sacred Games</i>\n\n{user} ko bhi aaj aisa hi laga. 😌",
-    "🎬 <b>“Apna time aayega.”</b>\n<i>— Gully Boy</i>\n\n{user} yahi soch ke button dabate rahe. ⏳",
-    "🎬 <b>“Jhukega nahi saala!”</b>\n<i>— Pushpa</i>\n\nBot ne bhi wahi bola, {user}. 💪",
-    "🎬 <b>“Rishte mein to hum tumhare baap lagte hain, naam hai Vasuki.”</b>\n<i>— Shahenshah</i>\n\nBot ka intro sun liya {user}? 🐍",
-    "🎬 <b>“Don ko pakadna mushkil hi nahi, namumkin hai.”</b>\n<i>— Don</i>\n\n{user} ka mission bhi wahi tha. 😎",
-    "🎬 <b>“Our business is our business, none of your business.”</b>\n<i>— Race 3</i>\n\n{user}, isko frame karwa lo. 😌",
-    "🎬 <b>“How's the josh?”</b>\n<i>— Uri: The Surgical Strike</i>\n\n{user}: HIGH SIR! Bot: dheere bhai, dheere. 😅",
-    "🎬 <b>“Aata majhi satakli!”</b>\n<i>— Singham</i>\n\n{user} ke ek click se satak gayi. 😤",
-    "🎬 <b>“Keh diya na, bas keh diya!”</b>\n<i>— Kabhi Khushi Kabhie Gham</i>\n\nBot ne bhi bas keh diya, {user}. 🙅",
-    "🎬 <b>“Kabhi kabhi kuch jeetne ke liye kuch haarna padta hai.”</b>\n<i>— Baazigar</i>\n\nAaj {user} ki turn thi. 🎲",
-    "🎬 <b>“All is well.”</b>\n<i>— 3 Idiots</i>\n\n{user}, dil pe haath rakho aur aage badho. 🤲",
-    "🎬 <b>“Kattappa ne Baahubali ko kyun mara?”</b>\n<i>— Baahubali</i>\n\nAur {user} ne ye button kyun dabaya? Do sawaal, jawab nahi. 🤔",
-    "🎬 <b>“Ek baar jo maine commitment kar di, to main khud ki bhi nahi sunta.”</b>\n<i>— Wanted</i>\n\nBot ki commitment bhi pakki hai, {user}. 🔒",
-    "🎬 <b>“Sattar minute!”</b>\n<i>— Chak De! India</i>\n\n{user}, ghadi dekho — khel khatam. 🏑",
+# DM replies. Deliberately short: the same text is reused as a Telegram popup
+# alert, which truncates at ~190 characters, so the point has to land in the
+# first line. Anything actionable lives in DENY_FOOTERS.
+DENY_PRIVATE = [
+    "\U0001F512 <b>Admin-only command</b>\n\n{user}, this control is limited to the class admins.",
+    "\U0001F512 <b>Restricted control</b>\n\n{user}, only the class admins can run this one.",
+    "\U0001F512 <b>Admins only</b>\n\n{user}, scheduling and class settings are managed by the admins.",
+    "\U0001F6E1 <b>Permission needed</b>\n\n{user}, this action belongs to the admin panel.",
+    "\U0001F512 <b>Not open to members</b>\n\n{user}, this part of the bot is reserved for admins.",
+    "\U0001F6E1 <b>Access denied</b>\n\n{user}, your account does not have admin rights here.",
+    "\U0001F512 <b>Locked</b>\n\n{user}, class management commands are admin-only.",
+    "\U0001F510 <b>Admin rights required</b>\n\n{user}, you will need admin access for this one.",
 ]
 
-# Roasts for groups — one-line dialogues with the film credited. Always sent
-# silently (disable_notification) and auto-deleted, so nobody gets pinged.
-DENY_ROASTS_GROUP = [
-    "🎬 {user} — <i>“Tumse na ho payega.”</i> <b>(Gangs of Wasseypur)</b>",
-    "🎬 {user} — <i>“Namumkin hai.”</i> <b>(Don)</b>",
-    "🎬 {user} — <i>“Keh diya na, bas keh diya!”</i> <b>(Kabhi Khushi Kabhie Gham)</b>",
-    "🎬 {user} — <i>“Mogambo khush nahi hua.”</i> <b>(Mr. India)</b>",
-    "🎬 {user} — <i>“Utha le re Deva, utha le!”</i> <b>(Hera Pheri)</b>",
-    "🎬 {user} — <i>“Ye kya kar diya Raju!”</i> <b>(Phir Hera Pheri)</b>",
-    "🎬 {user} — <i>“Control, control!”</i> <b>(Welcome)</b>",
-    "🎬 {user} — <i>“Kitne aadmi the?”</i> <b>(Sholay)</b>",
-    "🎬 {user} — <i>“Galti se mistake ho gaya.”</i> <b>(Andaz Apna Apna)</b>",
-    "🎬 {user} — <i>“Mere paas maa hai... tumhare paas?”</i> <b>(Deewaar)</b>",
-    "🎬 {user} — <i>“Tareekh pe tareekh, tareekh pe tareekh...”</i> <b>(Damini)</b>",
-    "🎬 {user} — <i>“Jhukega nahi saala!”</i> <b>(Pushpa)</b>",
-    "🎬 {user} — <i>“Picture abhi baaki hai mere dost.”</i> <b>(Om Shanti Om)</b>",
-    "🎬 {user} — <i>“All is well.”</i> <b>(3 Idiots)</b>",
-    "🎬 {user} — <i>“Aata majhi satakli!”</i> <b>(Singham)</b>",
-    "🎬 {user} — <i>“How's the josh?”</i> <b>(Uri: The Surgical Strike)</b>",
-    "🎬 {user} — <i>“None of your business.”</i> <b>(Race 3)</b>",
-    "🎬 {user} — <i>“Kabhi kabhi lagta hai apun hi bhagwan hai.”</i> <b>(Sacred Games)</b>",
-    "🎬 {user} — <i>“Apna time aayega.”</i> <b>(Gully Boy)</b>",
-    "🎬 {user} — <i>“Kattappa ne Baahubali ko kyun mara?”</i> <b>(Baahubali)</b>",
+# Group replies — a single line, sent silently and auto-deleted, so the group
+# stays clean and nobody gets pinged.
+DENY_GROUP = [
+    "\U0001F512 {user} \u2014 that command is admin-only.",
+    "\U0001F512 {user} \u2014 admins only, nothing to do here.",
+    "\U0001F512 {user} \u2014 this control is not open to members.",
+    "\U0001F6E1 {user} \u2014 you need admin rights for that one.",
+    "\U0001F512 {user} \u2014 admin-only. You can still tap <b>Mark me present</b> on class alerts.",
+    "\U0001F512 {user} \u2014 restricted command. Message me privately if you need help.",
 ]
 
-# Roasts when a normal admin tries a super-admin-only action.
-DENY_ROASTS_SUPER = [
-    "🎬 <b>“Rishte mein to hum tumhare baap lagte hain.”</b>\n<i>— Shahenshah</i>\n\n{user}, seniority ka matlab samjho. 😎",
-    "🎬 <b>“Ek din ka CM ban gaye to poora system badal doge?”</b>\n<i>— Nayak</i>\n\n{user}, itni jaldi bhi kya hai. 😅",
-    "🎬 <b>“Mogambo khush hua...”</b>\n<i>— Mr. India</i>\n\n...phir bhi haan nahi boli, {user}. 😾",
-    "🎬 <b>“Kaun hai ye log, kahan se aate hain?”</b>\n<i>— Andaz Apna Apna</i>\n\n{user} ki entry dekh ke Teja bhi confuse. 😅",
-    "🎬 <b>“Rajya ka faisla raja karta hai.”</b>\n<i>— Baahubali</i>\n\nAur raja abhi busy hai, {user}. 👑",
-    "🎬 <b>“Yahan tak hi, iske aage mat aana.”</b>\n<i>— Sholay</i>\n\nThakur ki lakshman rekha, {user}. 🚧",
-    "🎬 <b>“Bahut na-insaafi hai.”</b>\n<i>— Sholay</i>\n\n{user}, hai na? 😅",
-    "🎬 <b>“Thoda dhyaan idhar bhi.”</b>\n<i>— Hera Pheri</i>\n\n{user}, apni line me raho. 😌",
+# A normal admin reaching for an owner-only action.
+DENY_SUPER = [
+    "\U0001F6E1 <b>Owner-only action</b>\n\n{user}, this one is limited to the bot owner.",
+    "\U0001F510 <b>Higher permission needed</b>\n\n{user}, your admin role does not cover this action.",
+    "\U0001F6E1 <b>Restricted to the owner</b>\n\n{user}, only the owner can change this.",
+    "\U0001F512 <b>Owner approval required</b>\n\n{user}, ask the owner to run this one.",
 ]
 
-# Footers for DM roasts only: the meme roasts, then this quietly tells them
-# how to actually get in. Rotated so the help line also stays fresh.
-# Group roasts skip this (they auto-delete, and it would just be clutter).
+# Appended to DM replies for members: the part they can act on.
 DENY_FOOTERS = [
-    "🔐 <b>Access chahiye?</b> Contact @AvadaKedavaaraa\n🔑 <b>Password hai?</b> <code>/login [password]</code>",
-    "🙏 <b>Sifarish lagani hai?</b> @AvadaKedavaaraa se baat karo\n🔑 <b>Ya seedha:</b> <code>/login [password]</code>",
-    "📩 <b>Entry chahiye?</b> @AvadaKedavaaraa ko msg karo\n🔑 <b>Password mila hai?</b> <code>/login [password]</code>",
+    "\U0001F4AC <b>Need access?</b> Message @AvadaKedavaaraa\n\U0001F511 <b>Already have the password?</b> <code>/login [password]</code>",
+    "\u2705 <b>As a member you can</b> tap <b>Mark me present</b> on any class alert, and send notes with <code>/feedback</code>\n\U0001F511 <b>Have the admin password?</b> <code>/login [password]</code>",
+    "\U0001F4AC <b>Think this is a mistake?</b> Ping @AvadaKedavaaraa\n\U0001F511 <b>Already approved?</b> <code>/login [password]</code>",
 ]
 
-# Per-user roast history so the same line never repeats back-to-back.
-_ROAST_HISTORY = {}
-# Group spam guard: user+chat -> last roast timestamp
-_ROAST_COOLDOWN = {}
-GROUP_ROAST_COOLDOWN = 25      # seconds before the same user is roasted again
-GROUP_ROAST_TTL = 8            # seconds before the roast self-destructs
+# Separate footer for the owner-only case: /login is no help to someone who is
+# already an admin, so point them at the owner instead.
+DENY_FOOTERS_SUPER = [
+    "\U0001F4AC <b>Need this done?</b> Ask @AvadaKedavaaraa to run it.",
+    "\U0001F4AC <b>Owner:</b> @AvadaKedavaaraa",
+]
 
-def _pick_roast(pool, key):
+# Per-user history so the same line never repeats back-to-back.
+_LINE_HISTORY = {}
+# Group spam guard: user+chat -> last reply timestamp
+_DENY_COOLDOWN = {}
+GROUP_DENY_COOLDOWN = 25       # seconds before the same user gets another reply
+GROUP_DENY_TTL = 8             # seconds before the group reply self-destructs
+
+def _pick_line(pool, key):
     """Random pick that avoids anything used recently for this key."""
-    hist = _ROAST_HISTORY.get(key)
+    hist = _LINE_HISTORY.get(key)
     if hist is None:
         hist = deque(maxlen=max(1, len(pool) - 1))
         # Keep the dict from growing forever on a busy group.
-        if len(_ROAST_HISTORY) > 500:
-            _ROAST_HISTORY.clear()
-        _ROAST_HISTORY[key] = hist
+        if len(_LINE_HISTORY) > 500:
+            _LINE_HISTORY.clear()
+        _LINE_HISTORY[key] = hist
 
     available = [line for line in pool if line not in hist]
     if not available:
@@ -1372,26 +1359,30 @@ def user_tag(user):
 
 def build_deny_message(user, scope="private"):
     """
-    Build a personalised, non-repeating film meme for this user.
-    DM roasts get a small footer with how to request access; group roasts don't.
+    Personalised, non-repeating "you can't use this" reply for one user.
+
+    DM replies carry a footer with the next step; group replies stay bare
+    because they self-delete a few seconds later and the footer would only be
+    clutter.
     """
     pools = {
-        "private": DENY_ROASTS_PRIVATE,
-        "group": DENY_ROASTS_GROUP,
-        "super": DENY_ROASTS_SUPER,
+        "private": DENY_PRIVATE,
+        "group": DENY_GROUP,
+        "super": DENY_SUPER,
     }
-    pool = pools.get(scope, DENY_ROASTS_PRIVATE)
+    pool = pools.get(scope, DENY_PRIVATE)
     uid = getattr(user, "id", 0)
-    text = _pick_roast(pool, f"{uid}:{scope}").format(user=user_tag(user))
+    text = _pick_line(pool, f"{uid}:{scope}").format(user=user_tag(user))
 
-    # Group roasts stay bare (they self-delete). DM roasts carry the footer so
-    # the user knows how to actually get access.
-    if scope != "group":
-        text += "\n\n" + _pick_roast(DENY_FOOTERS, f"{uid}:footer")
+    if scope == "super":
+        # They are already an admin, so /login instructions would be noise.
+        text += "\n\n" + _pick_line(DENY_FOOTERS_SUPER, f"{uid}:footer_super")
+    elif scope != "group":
+        text += "\n\n" + _pick_line(DENY_FOOTERS, f"{uid}:footer")
     return text
 
 async def _delete_after(context, chat_id, message_id, delay):
-    """Fire-and-forget cleanup so groups don't fill up with roasts."""
+    """Fire-and-forget cleanup so groups don't fill up with bot replies."""
     try:
         await asyncio.sleep(delay)
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -1402,11 +1393,11 @@ async def deny_access(update, context, scope=None, event=None):
     """
     Single entry point for every "you are not allowed" reply.
 
-    • Private chat  → full roast + how-to-get-access footer, stays in chat.
-    • Group chat    → short roast that mentions the user, then both the roast
-                      and the offending command are deleted. Repeat offenders
-                      inside the cooldown get silently cleaned up instead.
-    • Callback taps → roast shown as a popup alert.
+    • Private chat  → full reply + how-to-get-access footer, stays in chat.
+    • Group chat    → one short line that mentions the user, then both that
+                      line and the offending command are deleted. Repeat
+                      attempts inside the cooldown are cleaned up silently.
+    • Callback taps → reply shown as a popup alert.
 
     Every denial is also mirrored to the owner's DM, so you see who tried what
     and exactly what the bot said back.
@@ -1447,19 +1438,19 @@ async def deny_access(update, context, scope=None, event=None):
         chat_id = update.effective_chat.id
         cool_key = (chat_id, user.id if user else 0)
         now = time.time()
-        recently_roasted = now - _ROAST_COOLDOWN.get(cool_key, 0) < GROUP_ROAST_COOLDOWN
-        _ROAST_COOLDOWN[cool_key] = now
-        if len(_ROAST_COOLDOWN) > 500:
-            for k in [k for k, v in _ROAST_COOLDOWN.items() if now - v > 300]:
-                _ROAST_COOLDOWN.pop(k, None)
+        recently_replied = now - _DENY_COOLDOWN.get(cool_key, 0) < GROUP_DENY_COOLDOWN
+        _DENY_COOLDOWN[cool_key] = now
+        if len(_DENY_COOLDOWN) > 500:
+            for k in [k for k, v in _DENY_COOLDOWN.items() if now - v > 300]:
+                _DENY_COOLDOWN.pop(k, None)
 
-        # Remove the command they tried, roast or not.
+        # Remove the command they tried, whether or not we reply.
         try:
             await message.delete()
         except Exception:
             pass
 
-        if recently_roasted:
+        if recently_replied:
             await mirror_non_admin(
                 context, update, bot_reply=None,
                 event=event or "access denied in group (reply suppressed by cooldown)")
@@ -1475,9 +1466,9 @@ async def deny_access(update, context, scope=None, event=None):
                 disable_web_page_preview=True,
                 disable_notification=True
             )
-            asyncio.create_task(_delete_after(context, chat_id, sent.message_id, GROUP_ROAST_TTL))
+            asyncio.create_task(_delete_after(context, chat_id, sent.message_id, GROUP_DENY_TTL))
         except Exception as e:
-            logger.warning(f"Could not send group roast: {e}")
+            logger.warning(f"Could not send group denial: {e}")
         await mirror_non_admin(context, update, bot_reply=reply,
                                event=event or "access denied (group)")
         return False
@@ -1485,12 +1476,12 @@ async def deny_access(update, context, scope=None, event=None):
         logger.error(f"Error in deny_access: {e}")
         return False
 
-# Rotating filmy nudges for admins who use admin buttons inside a group.
+# Rotating reminders for admins who tap admin buttons inside the group.
 PRIVATE_ONLY_NUDGES = [
-    "🎬 <b>“Itna sannata kyun hai bhai?”</b>\n<i>— Sholay</i>\n\n{user}, chalo DM me. 📩",
-    "🎬 <b>“Control {user}, control!”</b>\n<i>— Welcome</i>\n\nYe tamasha DM me. 📩",
-    "🎬 <b>“Picture abhi baaki hai mere dost.”</b>\n<i>— Om Shanti Om</i>\n\n{user}, par ye picture DM me chalegi. 🍿",
-    "🎬 <b>“Thoda dhyaan idhar bhi.”</b>\n<i>— Hera Pheri</i>\n\n{user}, DM me aao. 📩",
+    "\U0001F4E9 {user} \u2014 admin controls only work in our private chat.",
+    "\U0001F4E9 {user} \u2014 let's do this in DM so the group stays clean.",
+    "\U0001F4E9 {user} \u2014 this panel is DM-only, message me directly.",
+    "\U0001F4E9 {user} \u2014 open our private chat and run it there.",
 ]
 
 async def require_private_admin(update, context):
@@ -1513,7 +1504,7 @@ async def require_private_admin(update, context):
         if not is_private_chat(update):
             message = update.effective_message
             if message:
-                nudge = _pick_roast(PRIVATE_ONLY_NUDGES, f"{user.id}:private_only")
+                nudge = _pick_line(PRIVATE_ONLY_NUDGES, f"{user.id}:private_only")
                 sent = await message.reply_text(
                     nudge.format(user=user_tag(user)),
                     parse_mode=ParseMode.HTML,
@@ -1853,7 +1844,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_type = update.effective_chat.type
 
-    # Strict Access Control - non-admins get a fresh roast every time, and the
+    # Strict Access Control - non-admins get a clear "admins only" reply, and the
     # owner gets a DM showing who opened the bot and what it said back.
     if not is_admin(user.username):
         await deny_access(update, context, event="opened the bot (/start)")
@@ -3105,7 +3096,10 @@ async def edit_scope_handler(update, context):
                 continue
 
             job.schedule_removal()
-            batch_tag = safe_text(data.get('batch'), 'CLASS').replace(' ', '')
+            # job_tag(), not a bare replace(' ', ''): "CSDA & AICS" would keep
+            # its '&' and the attendance button built from this ID would be
+            # rejected as an unknown class.
+            batch_tag = job_tag(safe_text(data.get('batch'), 'CLASS'), 'CLASS')
             new_job_id = f"{batch_tag}_{int(time.time())}_{edited_count}"
             context.job_queue.run_once(callback, next_t, chat_id=chat_id,
                                        name=new_job_id, data=data)
@@ -3363,6 +3357,9 @@ def _generate_class_notification(batch, subject, time_str, link=None):
             'cta': deque(maxlen=8),
             'link': deque(maxlen=6),
             'urgency': deque(maxlen=5),
+            # Border styles were picked with a bare random.choice, so a box
+            # design could render with the same frame several times running.
+            'style': deque(maxlen=3),
         }
     history = _generate_class_notification._history
 
@@ -3374,6 +3371,18 @@ def _generate_class_notification(batch, subject, time_str, link=None):
         c = random.choice(avail)
         history[cat].append(c)
         return c
+
+    def pick_named(options, cat):
+        """
+        pick() for pools of functions, rotated on the NAME.
+
+        The design and title builders are closures redefined on every call, so
+        the deque only ever held stale function objects — `x not in history`
+        was always True and the anti-repetition silently degraded to a plain
+        random.choice. That is why the same layout kept reappearing, sometimes
+        twice in a row. Names are stable across calls, so the rotation holds.
+        """
+        return options[pick(list(options), cat)]
 
     now = datetime.now(IST)
     day_name = now.strftime('%A')
@@ -3633,7 +3642,11 @@ def _generate_class_notification(batch, subject, time_str, link=None):
         label = f"{code_e} · {name_e}" if code_e else name_e
         return f"{sub_icon}  <b>{label}</b>"
 
-    title = pick([title_hero, title_stacked, title_inline], 'title')
+    title = pick_named({
+        'hero': title_hero,
+        'stacked': title_stacked,
+        'inline': title_inline,
+    }, 'title')
 
     # ─── ALIGNED DATA BLOCK ───
     # <pre> is the ONLY Telegram element rendered in a monospace font, so it
@@ -3642,7 +3655,7 @@ def _generate_class_notification(batch, subject, time_str, link=None):
     def data_pre():
         # Routed through _box so the card is bordered and width-aligned rather
         # than a bare <pre> with ragged rows.
-        return _box(_kv_rows(_pairs), style=random.choice(["light", "heavy", "round"]))
+        return _box(_kv_rows(_pairs), style=pick(["light", "heavy", "round"], 'style'))
 
     def data_quote():
         return (
@@ -3773,7 +3786,7 @@ def _generate_class_notification(batch, subject, time_str, link=None):
 
     def design_boxed():
         """Aligned monospace card with a plain border."""
-        style = random.choice(["light", "heavy", "double", "round", "mixed"])
+        style = pick(["light", "heavy", "double", "round", "mixed"], 'style')
         parts = [f"{status_chip}  {title()}"]
         if urgency:
             parts += ["", urgency]
@@ -3785,7 +3798,7 @@ def _generate_class_notification(batch, subject, time_str, link=None):
 
     def design_titled_box():
         """Subject embedded into the top border: ╔═ STATISTICS ═══╗"""
-        style = random.choice(["double", "heavy", "mixed", "light"])
+        style = pick(["double", "heavy", "mixed", "light"], 'style')
         parts = []
         if urgency:
             parts += [urgency, ""]
@@ -3798,7 +3811,7 @@ def _generate_class_notification(batch, subject, time_str, link=None):
 
     def design_panel():
         """Self-contained card — everything inside one aligned box."""
-        style = random.choice(["round", "light", "dashed", "block", "ascii"])
+        style = pick(["round", "light", "dashed", "block", "ascii"], 'style')
         parts = [box_full(style)]
         if urgency:
             parts += ["", urgency]
@@ -3807,10 +3820,12 @@ def _generate_class_notification(batch, subject, time_str, link=None):
         parts += ["", f"<i>{flavour}</i>", "", cta]
         return "\n".join(parts)
 
-    design = pick([
-        design_hero, design_editorial, design_ticker, design_brief,
-        design_chips, design_boxed, design_titled_box, design_panel,
-    ], 'design')
+    design = pick_named({
+        'hero': design_hero, 'editorial': design_editorial,
+        'ticker': design_ticker, 'brief': design_brief,
+        'chips': design_chips, 'boxed': design_boxed,
+        'titled_box': design_titled_box, 'panel': design_panel,
+    }, 'design')
     return design()
 
 
@@ -5101,7 +5116,9 @@ def seed_attendance_record(job_name, data):
 #     still live in the job queue) — otherwise arbitrary callback data could
 #     create unbounded keys, each one triggering a full-database upload
 #   • a per-user rate limit, so nobody can pump those uploads in a loop
-ATT_ID_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+# Historic IDs (created before job_tag() normalised them) can still contain
+# '&', '-' or '.', and those buttons are still live in the group.
+ATT_ID_RE = re.compile(r"^[A-Za-z0-9_&.\-]{1,64}$")
 ATT_MAX_TAPS = 8
 ATT_WINDOW = 60
 _att_taps = {}
@@ -5122,7 +5139,43 @@ def _attendance_rate_ok(user_id):
     return True
 
 
-def _is_known_class_id(job_id, context):
+def _tap_came_from_our_alert(query, context):
+    """
+    True when this callback belongs to a button THIS bot attached to a message
+    it posted in the linked group.
+
+    This is the guard that actually matters. Only the bot can attach an inline
+    keyboard, so a matching button on a bot-authored message is proof the class
+    ID is genuine — no database lookup required. The DB check alone was too
+    strict: the seeded record lives behind a debounced cloud write, so a restart
+    (or a record aged out by cleanup_old_data) left real buttons permanently
+    dead with "that class no longer exists".
+    """
+    msg = getattr(query, "message", None)
+    if msg is None:
+        return False
+
+    sender = getattr(msg, "from_user", None)
+    bot_id = getattr(getattr(context, "bot", None), "id", None)
+    if not sender or not bot_id or getattr(sender, "id", None) != bot_id:
+        return False
+
+    group_id = (DB.get("config") or {}).get("group_id")
+    chat_id = getattr(getattr(msg, "chat", None), "id", None)
+    try:
+        # group_id has been stored as a string by older imports.
+        if group_id is not None and int(chat_id) != int(group_id):
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    markup = getattr(msg, "reply_markup", None)
+    rows = getattr(markup, "inline_keyboard", None) or []
+    return any(getattr(btn, "callback_data", None) == query.data
+               for row in rows for btn in row)
+
+
+def _is_known_class_id(job_id, context, query=None):
     """True only for a job ID this bot actually created."""
     if isinstance(DB.get("attendance"), dict) and job_id in DB["attendance"]:
         return True
@@ -5131,8 +5184,10 @@ def _is_known_class_id(job_id, context):
             return True
     except Exception:
         pass
-    return any(j.get("name") == job_id for j in DB.get("active_jobs", [])
-               if isinstance(j, dict))
+    if any(j.get("name") == job_id for j in DB.get("active_jobs", [])
+           if isinstance(j, dict)):
+        return True
+    return query is not None and _tap_came_from_our_alert(query, context)
 
 
 async def mark_attendance(update, context):
@@ -5146,7 +5201,7 @@ async def mark_attendance(update, context):
         await query.answer("⏳ Slow down a moment.", show_alert=True)
         return
 
-    if not ATT_ID_RE.match(job_id) or not _is_known_class_id(job_id, context):
+    if not ATT_ID_RE.match(job_id) or not _is_known_class_id(job_id, context, query):
         logger.warning(f"Rejected attendance for unknown class id {job_id!r} "
                        f"from {getattr(user, 'id', '?')}")
         audit("attendance_forged", user, f"unknown class id: {job_id[:60]}", ok=False)
@@ -5452,7 +5507,10 @@ async def handle_photo(update, context):
                 run = now + timedelta(days=delta + (week * 7))
                 run = run.replace(hour=h, minute=m, second=0)
                 
-                jid = f"{batch}_{day}_{int(time.time())}_{c}"
+                # Batch text comes straight from the vision model, so it can
+                # contain spaces or punctuation — normalise before it becomes
+                # part of the attendance callback data.
+                jid = f"{job_tag(batch, 'CLASS')}_{job_tag(day, 'DAY')}_{int(time.time())}_{c}"
                 jdata = {"batch": batch, "subject": sub, "time_display": t, "link": "Check Group", "msg_type": "AI", "day": day}
                 
                 context.job_queue.run_once(send_alert_job, run, chat_id=gid, name=jid, data=jdata)
@@ -7003,7 +7061,8 @@ def _command_name(message, bot_username=None):
 async def guard_unknown_command(update, context):
     """
     Last handler for anything command-shaped that no other handler claimed.
-    Non-admins get roasted (and cleaned up in groups); admins get a nudge.
+    Non-admins get the access-denied reply (cleaned up in groups); admins get
+    a short "no such command" nudge.
     """
     try:
         message = update.effective_message
@@ -7022,8 +7081,8 @@ async def guard_unknown_command(update, context):
         if is_admin(user.username if user else None):
             if is_private_chat(update):
                 await message.reply_text(
-                    "🤔 <b>AISA KOI COMMAND NAHI HAI</b>\n\n"
-                    "<i>/start dabao aur menu se chuno.</i>",
+                    "🤔 <b>Unknown command</b>\n\n"
+                    "<i>Send /start and pick an action from the menu.</i>",
                     parse_mode=ParseMode.HTML
                 )
             return
@@ -7033,7 +7092,7 @@ async def guard_unknown_command(update, context):
         logger.error(f"Error in guard_unknown_command: {e}")
 
 async def guard_non_admin_dm(update, context):
-    """Non-admin sending random text to the bot in DM — roast, rate limited."""
+    """Non-admin sending random text to the bot in DM — reply, rate limited."""
     try:
         user = update.effective_user
         if is_admin(user.username if user else None):
@@ -7041,14 +7100,14 @@ async def guard_non_admin_dm(update, context):
 
         key = ("dm", user.id if user else 0)
         now = time.time()
-        if now - _ROAST_COOLDOWN.get(key, 0) < 12:
+        if now - _DENY_COOLDOWN.get(key, 0) < 12:
             # Reply is suppressed to avoid spamming them, but the owner still
             # gets to see everything a non-admin sends.
             await mirror_non_admin(
                 context, update, bot_reply=None,
-                event="DM to the bot (no reply — roast cooldown)")
+                event="DM to the bot (no reply — cooldown)")
             return
-        _ROAST_COOLDOWN[key] = now
+        _DENY_COOLDOWN[key] = now
 
         await deny_access(update, context, event="DM to the bot")
     except Exception as e:
@@ -7314,9 +7373,9 @@ def main():
     ))
 
     # ---- Catch-all guards: MUST stay last so real handlers win ----
-    # Any admin-only / unknown command touched by a non-admin gets a meme roast.
+    # Any admin-only / unknown command touched by a non-admin gets a denial.
     app.add_handler(MessageHandler(filters.COMMAND, guard_unknown_command))
-    # Non-admins DMing the bot random text also get roasted (rate limited).
+    # Non-admins DMing the bot random text get the same reply (rate limited).
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, guard_non_admin_dm))
     # Anything else a non-admin DMs (media, stickers, files) is reported to the
     # owner rather than silently dropped.
