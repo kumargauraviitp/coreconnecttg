@@ -75,6 +75,7 @@ from telegram.ext import (
     JobQueue
 )
 from telegram.request import HTTPXRequest 
+from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
 
 # SUPABASE CLIENT
 from supabase import create_client, Client
@@ -6400,9 +6401,33 @@ async def attendance_command(update, context):
 ERROR_ALERT_COOLDOWN = 300
 _error_alert_seen = {}
 
+# Transport-level noise that is not a bug and needs no owner DM.
+#
+#   Conflict   — another getUpdates poller is live. Normal for the few seconds a
+#                redeploy overlaps the old instance. It is raised once per
+#                running process, and each process has its own dedup table,
+#                which is exactly why this arrived as two identical DMs.
+#   TimedOut   — a request exceeded its deadline; PTB retries.
+#   RetryAfter — Telegram asked us to back off; PTB honours it.
+#
+# NetworkError is matched by exact type, NOT isinstance: BadRequest subclasses
+# it, and a BadRequest (malformed HTML, bad chat_id) is a genuine bug worth a DM.
+BENIGN_ERRORS = (Conflict, TimedOut, RetryAfter)
+
+
+def _is_benign_error(err):
+    return isinstance(err, BENIGN_ERRORS) or type(err) is NetworkError
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Log errors, alert the owner privately, keep details out of public chats"""
+    if _is_benign_error(context.error):
+        # Warning, not error, and no traceback: this is operational noise. It
+        # stays in the logs so a persistent conflict is still diagnosable.
+        logger.warning("Transient Telegram error (not reported): %s: %s",
+                       type(context.error).__name__, context.error)
+        return
+
     # Log the full traceback. Logging only str(error) gave messages like
     # "'NoneType' object has no attribute 'get'" with no indication of where.
     logger.error(
