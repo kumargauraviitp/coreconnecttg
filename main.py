@@ -3159,132 +3159,136 @@ def _format_time_12h(time_str):
         return str(time_str)
 
 
-def _vis_width(s):
-    """
-    Display width of a string in monospace cells.
+# ------------------------------------------------------------------------------
+# 🖼 ASCII FRAMES
+# ------------------------------------------------------------------------------
+# A framed card can only line up if two things are true on the reader's device:
+#
+#   1. Every glyph occupies exactly one monospace cell. That rules out the
+#      box-drawing characters (┌ ╔ ▛ ╌) the earlier version used: most mobile
+#      monospace fonts do not carry them, the client silently substitutes a
+#      glyph from another font, and the substitute brings its own advance width.
+#      That is what tore the right edge. Only +, -, =, |, # and * are safe —
+#      they are ASCII, so every font has them.
+#   2. The text is laid out in a monospace font at all, which on Telegram means
+#      <pre>. The trade-off is fixed by the Bot API: no entity may nest inside
+#      <pre>, so nothing in the frame can be bold, linked or coloured, and emoji
+#      are double-width. All of that lives OUTSIDE the frame.
+#
+# Interiors are folded to ASCII so len() IS the rendered width — no width table
+# to get wrong.
 
-    Emoji and CJK glyphs occupy TWO cells even in a monospace font, so len()
-    is not enough — using it is what makes hand-drawn boxes come out crooked.
-    """
-    import unicodedata
-    w = 0
-    for ch in s:
-        if unicodedata.combining(ch):
-            continue
-        if unicodedata.east_asian_width(ch) in ('W', 'F'):
-            w += 2
-        elif 0x1F300 <= ord(ch) <= 0x1FAFF or 0x2600 <= ord(ch) <= 0x27BF:
-            w += 2          # emoji / dingbats
-        elif ord(ch) == 0xFE0F:
-            continue        # variation selector renders nothing
-        else:
-            w += 1
-    return w
+# style -> (corner, horizontal, vertical)
+ASCII_FRAMES = {
+    "eq":    ("+", "=", "|"),
+    "dash":  ("+", "-", "|"),
+    "hash":  ("#", "=", "#"),
+    "star":  ("*", "-", "*"),
+    "dot":   ("+", ".", ":"),
+}
 
-
-def _wrap_to(text, width):
-    """Wrap on words using display width, hard-splitting overlong words."""
-    words, lines, cur = str(text).split(), [], ""
-    for word in words:
-        trial = f"{cur} {word}".strip()
-        if _vis_width(trial) <= width:
-            cur = trial
-            continue
-        if cur:
-            lines.append(cur)
-        while _vis_width(word) > width:
-            cut = ""
-            for ch in word:
-                if _vis_width(cut + ch) > width:
-                    break
-                cut += ch
-            lines.append(cut)
-            word = word[len(cut):]
-        cur = word
-    if cur:
-        lines.append(cur)
-    return lines or [""]
-
-
-# Border character sets: (tl, tr, bl, br, horizontal, vertical)
-BOX_STYLES = {
-    "light":   ("┌", "┐", "└", "┘", "─", "│"),
-    "heavy":   ("┏", "┓", "┗", "┛", "━", "┃"),
-    "double":  ("╔", "╗", "╚", "╝", "═", "║"),
-    "round":   ("╭", "╮", "╰", "╯", "─", "│"),
-    "dashed":  ("┌", "┐", "└", "┘", "╌", "╎"),
-    "block":   ("▛", "▜", "▙", "▟", "▀", "▌"),
-    "ascii":   ("+", "+", "+", "+", "=", "|"),
-    "mixed":   ("╒", "╕", "╘", "╛", "═", "│"),
+# Punctuation that would otherwise be dropped by the ASCII fold.
+_ASCII_FOLD = {
+    "—": "-", "–": "-", "―": "-", "·": "-", "•": "*",
+    "’": "'", "‘": "'", "“": '"', "”": '"', "…": "...",
+    "×": "x", "→": "->", "&": "&",
 }
 
 
-def _box(rows, style="light", title=None, width=None, pad=1, align_title="left"):
+def _ascii_fold(text):
     """
-    Build a monospace box that ACTUALLY lines up, wrapped in <pre>.
+    Reduce text to printable ASCII so one character equals one monospace cell.
 
-    Why <pre>: Telegram renders normal message text in a proportional font, so a
-    hand-drawn border's right edge drifts and looks broken. <pre> is the only
-    Telegram element rendered in a true monospace font, which is what makes
-    every row the same width on every device.
-
-    Two rules for the interior:
-      • No emoji or HTML inside. Emoji are double-width and vary per platform,
-        and Telegram does not render <b> inside <pre>. Emoji go OUTSIDE the box.
-      • Content is width-computed with _vis_width, not len().
-
-    `title` is embedded into the top border, e.g. ╔═ STATISTICS ═══╗
+    Accents are stripped via NFKD (José -> Jose), known punctuation is mapped to
+    its ASCII twin, and anything left over (emoji, CJK) is dropped rather than
+    guessed at — a double-width glyph inside the frame would push that row one
+    cell wider than the rest.
     """
-    tl, tr, bl, br, h, v = BOX_STYLES.get(style, BOX_STYLES["light"])
+    import unicodedata
+    out = []
+    for ch in unicodedata.normalize("NFKD", str(text)):
+        if unicodedata.combining(ch):
+            continue
+        if ch in _ASCII_FOLD:
+            out.append(_ASCII_FOLD[ch])
+        elif 32 <= ord(ch) < 127:
+            out.append(ch)
+        elif ch in ("\t",):
+            out.append(" ")
+    return "".join(out)
 
-    # Only wrap rows that genuinely overflow. _wrap_to() re-joins on single
-    # spaces, which would collapse the column padding built by _kv_rows().
-    limit = (width - pad * 2) if width else 34
+
+def _frame_rows(pairs, width):
+    """'Label  value' rows, label column padded, truncated to the frame width."""
+    labels = [_ascii_fold(k) for k, _ in pairs]
+    label_w = max((len(x) for x in labels), default=0)
+    rows = []
+    for label, (_, val) in zip(labels, pairs):
+        row = f"{label.ljust(label_w)}  {_ascii_fold(val)}"
+        rows.append(row[:width] if len(row) > width else row)
+    return rows
+
+
+def _ascii_frame(rows, style="eq", title=None, width=30, pad=1):
+    """
+    Fixed-width ASCII card, wrapped in <pre> so it renders monospace.
+
+    Width is fixed rather than fitted to the content: a card that changes width
+    every class reads as unstable, and a fixed 30 columns still fits the
+    narrowest phone without the <pre> block scrolling sideways.
+    """
+    corner, h, v = ASCII_FRAMES.get(style, ASCII_FRAMES["eq"])
+    inner = width - pad * 2
+
     body = []
     for r in rows:
+        r = _ascii_fold(r)
         if not r:
             body.append("")
-        elif _vis_width(r) <= limit:
+            continue
+        # Only re-wrap rows that genuinely overflow. Wrapping splits on
+        # whitespace and rejoins on single spaces, which would collapse the
+        # label column _frame_rows() just built ("Batch  CSDA" -> "Batch CSDA").
+        if len(r) <= inner:
             body.append(r)
-        else:
-            body.extend(_wrap_to(r, limit))
+            continue
+        line = ""
+        for word in r.split():
+            if not line:
+                line = word
+            elif len(line) + 1 + len(word) <= inner:
+                line += " " + word
+            else:
+                body.append(line)
+                line = word
+            while len(line) > inner:
+                body.append(line[:inner])
+                line = line[inner:]
+        body.append(line)
 
-    inner = width - pad * 2 if width else max(
-        [_vis_width(r) for r in body] + [_vis_width(title) + 2 if title else 0]
-    )
-    if title and inner < _vis_width(title) + 2:
-        inner = _vis_width(title) + 2
-    total = inner + pad * 2
-
-    # ── top border, optionally carrying the title ──
     if title:
-        t = f" {title} "
-        room = total - _vis_width(t)
-        if align_title == "center":
-            left = max(1, room // 2)
-        else:
-            left = 1
-        right = max(1, room - left)
-        top = f"{tl}{h * left}{t}{h * right}{tr}"
+        label = _ascii_fold(title).strip()
+        room = inner - 4
+        if len(label) > room:
+            # Cut at a word boundary. A hard slice produces borders like
+            # "+-- CYBER SECURITY FOUNDATIO --+", which reads as a defect.
+            cut = label[:room]
+            label = cut[:cut.rindex(" ")] if " " in cut else cut
+        t = f" {label} "
+        left = 2
+        right = max(1, width - left - len(t))
+        top = f"{corner}{h * left}{t}{h * right}{corner}"
     else:
-        top = f"{tl}{h * total}{tr}"
+        top = f"{corner}{h * width}{corner}"
 
     out = [top]
     for r in body:
-        gap = inner - _vis_width(r)
-        out.append(f"{v}{' ' * pad}{r}{' ' * gap}{' ' * pad}{v}")
-    out.append(f"{bl}{h * total}{br}")
+        out.append(f"{v}{' ' * pad}{r.ljust(inner)}{' ' * pad}{v}")
+    out.append(f"{corner}{h * width}{corner}")
 
+    # Escape LAST: padding is computed on the real characters, so '&' counts as
+    # one cell here and Telegram unescapes '&amp;' back to one cell on display.
     return "<pre>" + html.escape("\n".join(out)) + "</pre>"
-
-
-def _kv_rows(pairs, sep="  "):
-    """Column-aligned 'Label   value' rows for use inside a box."""
-    label_w = max(_vis_width(k) for k, _ in pairs) if pairs else 0
-    rows = []
-    for k, val in pairs:
-        rows.append(f"{k}{' ' * (label_w - _vis_width(k))}{sep}{val}")
-    return rows
 
 
 def _split_subject(subject):
@@ -3323,25 +3327,32 @@ def _generate_class_notification(batch, subject, time_str, link=None):
     Premium class notification generator.
 
     ── Why this looks good (design rationale) ──────────────────────────
-    Telegram renders messages in a PROPORTIONAL font. That single fact
-    drives every decision here:
+    Telegram renders messages in a PROPORTIONAL font, and only honours a
+    fixed set of entities. That drives every decision here:
 
-      1. ASCII boxes (┌──┐ / ╔══╗) can never align — the right edge goes
-         ragged and looks broken. They are gone. Alignment is achieved
-         with <pre>, the only element Telegram renders in true monospace.
-      2. <blockquote> is a native Telegram UI element (indent + left bar).
-         It costs zero characters and looks designed. Used as the accent.
-      3. Hierarchy beats decoration. Big bold NAME, small course code,
+      1. Framed cards are ASCII-only and live in <pre>. See ASCII_FRAMES
+         for the full reasoning: box-drawing glyphs (┌ ╔ ▛) are missing
+         from most mobile monospace fonts, the client substitutes them,
+         and the substitute's advance width is what tears the right edge.
+         +, -, = and | exist everywhere, so they hold. Everything
+         formatted — bold, links, emoji — sits outside the frame, because
+         the Bot API forbids nesting entities inside <pre>.
+      2. The unframed designs get their structure from entities the client
+         lays out itself: <blockquote> (indent + coloured left bar), <b>
+         for hierarchy, <code> for tinted values. No padding characters,
+         and they adapt to any screen width.
+      3. No multi-space alignment outside <pre>. Runs of spaces in a
+         proportional font do not form a column, they just look uneven.
+      4. Hierarchy beats decoration. Big bold NAME, small course code,
          then data. The eye lands in the right place instantly.
-      4. Whitespace is what makes layout look expensive. Emoji density is
-         what makes it look like spam. So: generous spacing, few emoji.
       5. Urgency drives engagement more than ornament. A live countdown
          ("starts in 10 minutes") is the actual hook.
 
     ── Variety ─────────────────────────────────────────────────────────
-    4 design systems × 3 title treatments × 12 headers × 10 openers
-    × 12 flavours/subject × 10 CTAs × 8 link styles, all tracked by
-    per-category deques → no repeat for weeks of daily classes.
+    10 design systems (3 framed, 7 native) × 3 title treatments × 5 frame
+    styles × 10 rules × 10 openers × 12 flavours/subject × 10 CTAs
+    × 8 link styles, all tracked by per-category deques → no repeat for
+    weeks of daily classes.
     """
     import random
     from collections import deque
@@ -3349,6 +3360,9 @@ def _generate_class_notification(batch, subject, time_str, link=None):
     # ─── ANTI-REPETITION ───
     if not hasattr(_generate_class_notification, '_history'):
         _generate_class_notification._history = {
+            # 6 of 10: blocks any near-term repeat while still leaving a real
+            # choice each time. A maxlen of 9 would leave exactly one candidate
+            # and turn the rotation into a fixed cycle.
             'design': deque(maxlen=6),
             'title': deque(maxlen=2),
             'rule': deque(maxlen=8),
@@ -3357,9 +3371,7 @@ def _generate_class_notification(batch, subject, time_str, link=None):
             'cta': deque(maxlen=8),
             'link': deque(maxlen=6),
             'urgency': deque(maxlen=5),
-            # Border styles were picked with a bare random.choice, so a box
-            # design could render with the same frame several times running.
-            'style': deque(maxlen=3),
+            'frame': deque(maxlen=3),
         }
     history = _generate_class_notification._history
 
@@ -3395,6 +3407,12 @@ def _generate_class_notification(batch, subject, time_str, link=None):
     code, name = _split_subject(subject)
     code_e = html.escape(code)
     name_e = html.escape(name)
+    # Upper-case the RAW text, then escape. Doing it the other way round
+    # (name_e.upper()) turns the escape sequences themselves into &AMP; and
+    # &LT;, and Telegram only recognises the lowercase forms &amp; &lt; &gt;
+    # &quot; — so any subject containing '&' rendered as literal '&AMP;' or
+    # failed the parse outright and fell back to unformatted plain text.
+    name_upper_e = html.escape(str(name).upper())
     batch_e = html.escape(str(batch or "—"))
     sub_lower = str(subject or "").lower()
 
@@ -3438,12 +3456,12 @@ def _generate_class_notification(batch, subject, time_str, link=None):
     if mins is not None:
         if mins <= 0:
             urgency = pick([
-                "🔴  <b>LIVE NOW</b>",
-                "🔴  <b>Starting right now</b>",
-                "🔴  <b>Class is live</b>",
+                "🔴 <b>LIVE NOW</b>",
+                "🔴 <b>Starting right now</b>",
+                "🔴 <b>Class is live</b>",
             ], 'urgency')
         elif mins <= 2:
-            urgency = f"🔴  <b>Starting now</b>"
+            urgency = f"🔴 <b>Starting now</b>"
         elif mins <= 20:
             urgency = pick([
                 f"⏳  Starts in <b>{mins} minutes</b>",
@@ -3595,36 +3613,36 @@ def _generate_class_notification(batch, subject, time_str, link=None):
     if has_link:
         href = html.escape(str(link), quote=True)
         link_line = pick([
-            f"▶️  <a href=\"{href}\"><b>JOIN CLASS</b></a>",
-            f"🔗  <a href=\"{href}\"><b>Join the class</b></a>",
-            f"⚡  <a href=\"{href}\"><b>Join now</b></a>",
-            f"🎯  <a href=\"{href}\"><b>Enter class</b></a>",
-            f"▶️  <a href=\"{href}\"><b>Open session</b></a>",
-            f"🔗  <a href=\"{href}\"><b>Tap to join</b></a>",
-            f"🚀  <a href=\"{href}\"><b>Launch class</b></a>",
-            f"↗️  <a href=\"{href}\"><b>Go to class</b></a>",
+            f"▶️ <a href=\"{href}\"><b>JOIN CLASS</b></a>",
+            f"🔗 <a href=\"{href}\"><b>Join the class</b></a>",
+            f"⚡ <a href=\"{href}\"><b>Join now</b></a>",
+            f"🎯 <a href=\"{href}\"><b>Enter class</b></a>",
+            f"▶️ <a href=\"{href}\"><b>Open session</b></a>",
+            f"🔗 <a href=\"{href}\"><b>Tap to join</b></a>",
+            f"🚀 <a href=\"{href}\"><b>Launch class</b></a>",
+            f"↗️ <a href=\"{href}\"><b>Go to class</b></a>",
         ], 'link')
     elif str(link).strip().lower() == "check group":
-        link_line = "🔗  <i>Link will be shared in the group.</i>"
+        link_line = "🔗 <i>Link will be shared in the group.</i>"
 
     # ─── CTA ───
     cta = pick([
-        "👇  Mark your attendance",
-        "👇  Tap below to check in",
-        "👇  Confirm you're here",
-        "👇  One tap to mark present",
-        "👇  Attendance below",
-        "👇  Check in below",
-        "👇  Register your attendance",
-        "👇  Let us know you're in",
-        "👇  Sign in below",
-        "👇  Mark yourself present",
+        "👇 Mark your attendance",
+        "👇 Tap below to check in",
+        "👇 Confirm you're here",
+        "👇 One tap to mark present",
+        "👇 Attendance below",
+        "👇 Check in below",
+        "👇 Register your attendance",
+        "👇 Let us know you're in",
+        "👇 Sign in below",
+        "👇 Mark yourself present",
     ], 'cta')
 
     # ─── TITLE TREATMENTS (visual hierarchy) ───
     def title_hero():
         """Icon + big name, course code underneath. Maximum impact."""
-        out = f"{sub_icon}  <b>{name_e.upper()}</b>"
+        out = f"{sub_icon} <b>{name_upper_e}</b>"
         if code_e:
             out += f"\n<i>{code_e}</i>"
         return out
@@ -3634,13 +3652,13 @@ def _generate_class_notification(batch, subject, time_str, link=None):
         out = ""
         if code_e:
             out += f"<code>{code_e}</code>\n"
-        out += f"{sub_icon}  <b>{name_e}</b>"
+        out += f"{sub_icon} <b>{name_e}</b>"
         return out
 
     def title_inline():
         """Single strong line."""
         label = f"{code_e} · {name_e}" if code_e else name_e
-        return f"{sub_icon}  <b>{label}</b>"
+        return f"{sub_icon} <b>{label}</b>"
 
     title = pick_named({
         'hero': title_hero,
@@ -3648,35 +3666,35 @@ def _generate_class_notification(batch, subject, time_str, link=None):
         'inline': title_inline,
     }, 'title')
 
-    # ─── ALIGNED DATA BLOCK ───
-    # <pre> is the ONLY Telegram element rendered in a monospace font, so it
-    # is the only way to get columns that actually line up on every device.
-    # Keep lines short — <pre> does not wrap on some clients.
-    def data_pre():
-        # Routed through _box so the card is bordered and width-aligned rather
-        # than a bare <pre> with ragged rows.
-        return _box(_kv_rows(_pairs), style=pick(["light", "heavy", "round"], 'style'))
-
+    # ─── DATA BLOCKS ───
+    # Every row is one label + one value on its own line. No attempt is made to
+    # line values up into a column: Telegram's message font is proportional, so
+    # runs of spaces produce a ragged edge rather than a grid. Structure comes
+    # from <blockquote>, <b> and <code> instead, which the client renders
+    # natively at whatever width the screen happens to be.
     def data_quote():
+        """Native quote block — indent plus a coloured left bar, zero characters spent."""
         return (
             "<blockquote>"
-            f"🕒  <b>{time_12h}</b>\n"
-            f"📅  {day_name}, {date_full}\n"
-            f"🎓  {batch_e}"
+            f"🕒 <b>{time_12h}</b>\n"
+            f"📅 {day_name}, {date_full}\n"
+            f"🎓 {batch_e}"
             "</blockquote>"
         )
 
     def data_inline():
+        """Two tight lines, for the scannable alert layout."""
         return (
-            f"🕒  <b>{time_12h}</b>   📅  {day_short}, {date_short}\n"
-            f"🎓  {batch_e}"
+            f"🕒 <b>{time_12h}</b> · 📅 {day_short}, {date_short}\n"
+            f"🎓 {batch_e}"
         )
 
     def data_rows():
+        """Bold labels, plain values. Reads like a document, wraps cleanly."""
         return (
-            f"<b>Time</b>    ·  {time_12h}\n"
-            f"<b>Date</b>    ·  {day_name}, {date_short}\n"
-            f"<b>Batch</b>   ·  {batch_e}"
+            f"<b>Time</b> · {time_12h}\n"
+            f"<b>Date</b> · {day_name}, {date_short}\n"
+            f"<b>Batch</b> · {batch_e}"
         )
 
     def data_chips():
@@ -3684,48 +3702,68 @@ def _generate_class_notification(batch, subject, time_str, link=None):
         # batch_e is already HTML-escaped; unescaping here would emit a raw '&'
         # from "CSDA & AICS" and break the parser.
         return (
-            f"⏰  <code>{time_12h}</code>\n"
-            f"📅  <code>{day_name}, {date_short}</code>\n"
-            f"{batch_chip}  <code>{batch_e}</code>"
+            f"⏰ <code>{time_12h}</code>\n"
+            f"📅 <code>{day_name}, {date_short}</code>\n"
+            f"{batch_chip} <code>{batch_e}</code>"
         )
 
-    # ── Box data blocks (perfectly aligned, drawn inside <pre>) ──
-    # Interiors are plain text: emoji are double-width and <b> is not rendered
-    # inside <pre>, so both would break the alignment. Accents live outside.
-    _pairs = [("Time", time_12h),
-              ("Date", f"{day_short}, {date_short}"),
-              ("Batch", html.unescape(batch_e))]
+    def data_quote_chips():
+        """Quote block with tinted values — the most 'designed' of the four."""
+        return (
+            "<blockquote>"
+            f"⏰ <code>{time_12h}</code>\n"
+            f"📅 <code>{day_name}, {date_short}</code>\n"
+            f"{batch_chip} <code>{batch_e}</code>"
+            "</blockquote>"
+        )
 
-    def box_plain(style):
-        return _box(_kv_rows(_pairs), style=style)
+    # ── Framed cards ──
+    # Plain text only inside: no emoji, no <b>, no links. Those go around it.
+    _frame_pairs = [("Time", time_12h),
+                    ("Date", f"{day_short}, {date_short}"),
+                    ("Batch", batch)]
 
-    def box_titled(style, centered=False):
-        t = (code or name).upper()[:22]
-        return _box(_kv_rows(_pairs), style=style, title=t,
-                    align_title="center" if centered else "left")
+    def frame_plain(style):
+        return _ascii_frame(_frame_rows(_frame_pairs, 28), style=style)
 
-    def box_full(style):
-        """Subject inside the box too, so the card is self-contained."""
-        rows = _wrap_to(html.unescape(name), 30)
+    def frame_titled(style):
+        """Course code sits in the top border: +== CDA 201 ==========+"""
+        return _ascii_frame(_frame_rows(_frame_pairs, 28), style=style,
+                            title=(code or name).upper())
+
+    def frame_full(style):
+        """Self-contained card — subject inside the frame with the data."""
+        rows = [name]
         if code:
-            rows.append(html.unescape(code))
+            rows.append(code)
         rows.append("")
-        rows.extend(_kv_rows(_pairs))
-        return _box(rows, style=style, width=32)
+        rows.extend(_frame_rows(_frame_pairs, 28))
+        return _ascii_frame(rows, style=style)
+
+    def data_card():
+        """Self-contained quote block: subject inside the card with the data."""
+        head = f"{sub_icon} <b>{name_e}</b>"
+        if code_e:
+            head += f"\n<i>{code_e}</i>"
+        return (
+            "<blockquote>"
+            f"{head}\n\n"
+            f"🕒 <b>{time_12h}</b>\n"
+            f"📅 {day_name}, {date_short}\n"
+            f"🎓 {batch_e}"
+            "</blockquote>"
+        )
 
     # ══════════════════════════════════════════════════════════════════
-    #  DESIGN SYSTEMS — four genuinely different visual identities
+    #  DESIGN SYSTEMS — genuinely different visual identities
     # ══════════════════════════════════════════════════════════════════
 
     def design_hero():
-        """
-        Poster style. Rule, big title, countdown, aligned monospace card,
-        bold CTA link. The most striking of the four.
-        """
+        """Poster style. Rules top and bottom, big title, countdown, quoted data."""
         parts = [rule, "", title()]
         if urgency:
             parts += ["", urgency]
-        parts += ["", data_pre()]
+        parts += ["", data_quote_chips()]
         if link_line:
             parts += ["", link_line]
         parts += ["", f"<i>{flavour}</i>", rule, "", cta]
@@ -3774,8 +3812,13 @@ def _generate_class_notification(batch, subject, time_str, link=None):
         return "\n".join(parts)
 
     def design_chips():
-        """Maximum colour: status chip, coloured batch chip, tinted <code> values."""
-        parts = [f"{status_chip}  {title()}"]
+        """Maximum colour: coloured batch chip and tinted <code> values.
+
+        No status_chip prefix here — the title treatments already lead with a
+        subject icon, and two emoji back to back read as clutter. The urgency
+        line below carries the 🔴/⏳ signal instead.
+        """
+        parts = [title()]
         if urgency:
             parts += ["", urgency]
         parts += ["", data_chips()]
@@ -3784,37 +3827,60 @@ def _generate_class_notification(batch, subject, time_str, link=None):
         parts += ["", f"<i>{flavour}</i>", "", cta]
         return "\n".join(parts)
 
-    def design_boxed():
-        """Aligned monospace card with a plain border."""
-        style = pick(["light", "heavy", "double", "round", "mixed"], 'style')
-        parts = [f"{status_chip}  {title()}"]
+    def design_card():
+        """Everything inside one quote block — the most contained layout."""
+        parts = []
         if urgency:
-            parts += ["", urgency]
-        parts += ["", box_plain(style)]
+            parts += [urgency, ""]
+        parts += [data_card()]
         if link_line:
             parts += ["", link_line]
         parts += ["", f"<i>{flavour}</i>", "", cta]
         return "\n".join(parts)
 
-    def design_titled_box():
-        """Subject embedded into the top border: ╔═ STATISTICS ═══╗"""
-        style = pick(["double", "heavy", "mixed", "light"], 'style')
+    def design_framed():
+        """ASCII card with the title, countdown and link outside the frame."""
+        style = pick(list(ASCII_FRAMES), 'frame')
+        # No status_chip: the title treatments already lead with a subject icon,
+        # and the urgency line below carries the 🔴/⏳ signal.
+        parts = [title()]
+        if urgency:
+            parts += ["", urgency]
+        parts += ["", frame_plain(style)]
+        if link_line:
+            parts += ["", link_line]
+        parts += ["", f"<i>{flavour}</i>", "", cta]
+        return "\n".join(parts)
+
+    def design_framed_titled():
+        """Course code embedded in the top border, subject named below."""
+        style = pick(list(ASCII_FRAMES), 'frame')
         parts = []
         if urgency:
             parts += [urgency, ""]
-        parts += [box_titled(style, centered=random.random() < 0.5)]
+        parts += [frame_titled(style), "", f"{sub_icon} <b>{name_e}</b>"]
         if link_line:
             parts += ["", link_line]
-        parts += ["", f"{sub_icon}  <b>{name_e}</b>",
-                  f"<i>{flavour}</i>", "", cta]
+        parts += ["", f"<i>{flavour}</i>", "", cta]
         return "\n".join(parts)
 
-    def design_panel():
-        """Self-contained card — everything inside one aligned box."""
-        style = pick(["round", "light", "dashed", "block", "ascii"], 'style')
-        parts = [box_full(style)]
+    def design_framed_full():
+        """Everything inside one frame — the most poster-like layout."""
+        style = pick(list(ASCII_FRAMES), 'frame')
+        parts = [frame_full(style)]
         if urgency:
             parts += ["", urgency]
+        if link_line:
+            parts += ["", link_line]
+        parts += ["", f"<i>{flavour}</i>", "", cta]
+        return "\n".join(parts)
+
+    def design_notice():
+        """Status line leads, title and data follow, flavour quoted at the end."""
+        parts = [f"{status_chip} <b>CLASS NOTICE</b>", rule, ""]
+        if urgency:
+            parts += [urgency, ""]
+        parts += [title(), "", data_quote()]
         if link_line:
             parts += ["", link_line]
         parts += ["", f"<i>{flavour}</i>", "", cta]
@@ -3823,8 +3889,10 @@ def _generate_class_notification(batch, subject, time_str, link=None):
     design = pick_named({
         'hero': design_hero, 'editorial': design_editorial,
         'ticker': design_ticker, 'brief': design_brief,
-        'chips': design_chips, 'boxed': design_boxed,
-        'titled_box': design_titled_box, 'panel': design_panel,
+        'chips': design_chips, 'card': design_card,
+        'notice': design_notice, 'framed': design_framed,
+        'framed_titled': design_framed_titled,
+        'framed_full': design_framed_full,
     }, 'design')
     return design()
 
