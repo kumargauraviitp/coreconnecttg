@@ -650,7 +650,7 @@ def cleanup_old_data(context=None):
 # ==============================================================================
 (
     SELECT_BATCH, NEW_SUBJECT_INPUT, SELECT_SUB_OR_ADD, SELECT_DAYS, 
-    INPUT_START_DATE, INPUT_END_DATE, INPUT_TIME, INPUT_LINK,
+    INPUT_START_DATE, INPUT_END_DATE, INPUT_TIME, INPUT_END_TIME, INPUT_LINK,
     SELECT_OFFSET, MSG_TYPE_CHOICE, INPUT_MANUAL_MSG, GEMINI_PROMPT_INPUT,
     EDIT_SELECT_JOB, EDIT_CHOOSE_FIELD, EDIT_NEW_VALUE, ADD_ADMIN_INPUT,
     REMOVE_ADMIN_INPUT, CUSTOM_OFFSET_INPUT, NIGHT_SCHEDULE_TIME,
@@ -661,7 +661,7 @@ def cleanup_old_data(context=None):
     RESET_CONFIRM, EDIT_TOPIC_SELECT, EDIT_TOPIC_NEW_NAME, DELETE_TOPIC_CONFIRM,
     EDIT_SELECT_SCOPE, EDIT_BULK_DAYS,
     COMBINED_SELECT_SUB, EDIT_MSG_TYPE
-) = range(42)
+) = range(43)
 
 # Regex to match any menu button for canceling wizards
 MENU_REGEX = "^(📸 AI Auto-Schedule|🧠 Custom AI|🟦 Schedule CSDA|🟧 Schedule AICS|📅 Schedule Classes|📝 Custom Message|➕ Add Subject|📂 More Options|✏️ Edit Class|🗑️ Delete Class|📅 View Schedule|📊 Attendance|📚 All Subjects|📤 Export Data|📥 Import Data|👥 Manage Admins|💬 Manage Topics|🛠️ Admin Tools|🔙 Back to Main|🌙 Night Schedule|☁️ Force Save|🔄 Reset System|🗑️ Remove Topic|➕ Add Topic Manual|📋 List Topics|👤 Add Admin|🗑️ Remove Admin|📋 View Admins)$"
@@ -910,12 +910,21 @@ async def generate_hype_message(batch, subject, time_str, link):
     try:
         DB["system_stats"]["ai_requests"] += 1
         date_str = datetime.now(IST).strftime('%A, %d %B')
+        time_formatted = _format_time_12h(time_str)
         prompt = (
-            f"Create a HTML notification for a class.\n"
-            f"Info: {batch} | {subject} | {time_str} | {date_str} | {link}\n"
-            f"Rules: Use HTML tags (<b>, <i>, <code>, <a href='...'>). "
-            f"Do NOT use <br> or <div>. Use newlines (\\n) for breaks. "
-            f"Include <a href='{link}'>JOIN CLASS</a>. Make it exciting."
+            f"Create a high quality HTML notification for an upcoming college class.\n"
+            f"Info:\n"
+            f"- Batch: {batch}\n"
+            f"- Subject: {subject}\n"
+            f"- Timing: {time_formatted}\n"
+            f"- Date: {date_str}\n"
+            f"- Link: {link}\n\n"
+            f"Rules:\n"
+            f"1. Use allowed HTML tags only: <b>, <i>, <code>, <a href='...'>, <blockquote>.\n"
+            f"2. Do NOT use <br>, <p>, or <div>. Use real newlines (\\n) for spacing.\n"
+            f"3. Explicitly state the class timing ({time_formatted}) including both start and end time.\n"
+            f"4. If a join link is provided, include <a href='{link}'>JOIN CLASS</a>.\n"
+            f"5. Make it clear, stylish, and motivating."
         )
         response = await asyncio.to_thread(ai_model.generate_content, prompt)
         text = response.text
@@ -2202,9 +2211,9 @@ async def wizard_end_date(update, context):
         if text == 'none': context.user_data['end_dt'] = None
         else: context.user_data['end_dt'] = datetime.strptime(text, "%d-%m-%Y").replace(tzinfo=IST)
         await update.message.reply_text(
-            "⏰ <b>CLASS TIME</b>\n"
+            "⏰ <b>CLASS START TIME</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "<i>Enter in 24h format:</i> <code>HH:MM</code>\n"
+            "<i>Enter start time in 24h format:</i> <code>HH:MM</code>\n"
             "<i>Example:</i> <code>14:30</code>",
             parse_mode=ParseMode.HTML
         )
@@ -2218,7 +2227,65 @@ async def wizard_end_date(update, context):
         return INPUT_END_DATE
 
 async def wizard_time(update, context):
-    context.user_data['sch_time'] = update.message.text
+    text = update.message.text.strip()
+    try:
+        parts = text.split(":")
+        if len(parts) != 2:
+            raise ValueError
+        h, m = int(parts[0]), int(parts[1])
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            raise ValueError
+        start_time_str = f"{h:02d}:{m:02d}"
+    except Exception:
+        await update.message.reply_text(
+            "❌ <b>INVALID TIME FORMAT!</b>\n\n"
+            "<i>Please use 24h format:</i> <code>HH:MM</code>\n"
+            "<i>Example:</i> <code>14:30</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return INPUT_TIME
+
+    context.user_data['sch_start_time'] = start_time_str
+    context.user_data['sch_time'] = start_time_str
+    context.user_data['sch_time_display'] = start_time_str
+
+    await update.message.reply_text(
+        "⏰ <b>CLASS END TIME</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<i>Enter end time in 24h format:</i> <code>HH:MM</code>\n"
+        "<i>Example:</i> <code>15:30</code>\n\n"
+        "<i>Or type:</i> <code>None</code> <i>to skip end time</i>",
+        parse_mode=ParseMode.HTML
+    )
+    return INPUT_END_TIME
+
+async def wizard_end_time(update, context):
+    text = update.message.text.strip()
+    start_time = context.user_data.get('sch_start_time', context.user_data.get('sch_time', '12:00'))
+
+    if text.lower() in ('none', 'skip', 'no', '-'):
+        context.user_data['sch_end_time'] = None
+        context.user_data['sch_time_display'] = start_time
+    else:
+        try:
+            parts = text.split(":")
+            if len(parts) != 2:
+                raise ValueError
+            h, m = int(parts[0]), int(parts[1])
+            if not (0 <= h <= 23 and 0 <= m <= 59):
+                raise ValueError
+            end_time_str = f"{h:02d}:{m:02d}"
+            context.user_data['sch_end_time'] = end_time_str
+            context.user_data['sch_time_display'] = f"{start_time} - {end_time_str}"
+        except Exception:
+            await update.message.reply_text(
+                "❌ <b>INVALID TIME FORMAT!</b>\n\n"
+                "<i>Please use 24h format:</i> <code>HH:MM</code> (e.g. <code>15:30</code>)\n"
+                "<i>Or type:</i> <code>None</code> <i>to skip.</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return INPUT_END_TIME
+
     await update.message.reply_text(
         "🔗 <b>CLASS LINK</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2409,8 +2476,9 @@ async def wizard_finalize(update_obj, context):
         run_dt = dt.replace(hour=h, minute=m, second=0)
         notify_dt = run_dt - timedelta(minutes=d['sch_offset'])
         job_id = f"{batch}_{int(time.time())}_{count}"
+        display_time_str = d.get('sch_time_display', t_str)
         job_data = {
-            "batch": batch, "subject": sub, "time_display": t_str, 
+            "batch": batch, "subject": sub, "time_display": display_time_str, 
             "link": d['sch_link'], "manual_msg": d.get('sch_manual_msg'),
             "msg_type": "MANUAL" if d.get('sch_manual_msg') else "AI",
             "message_thread_id": d.get('sch_topic_id')
@@ -2420,6 +2488,7 @@ async def wizard_finalize(update_obj, context):
         count += 1
     
     topic_name = DB.get("topics", {}).get(str(d.get('sch_topic_id')), "General") if d.get('sch_topic_id') else "General"
+    time_summary = _format_time_12h(d.get('sch_time_display', t_str))
     
     msg = (
         f"✅ <b>SCHEDULED SUCCESSFULLY</b>\n"
@@ -2428,7 +2497,7 @@ async def wizard_finalize(update_obj, context):
         f"📌 <i>Subject:</i> <b>{sub}</b>\n"
         f"🎯 <i>Batch:</i> <b>{batch}</b>\n"
         f"💬 <i>Topic:</i> <b>{topic_name}</b>\n"
-        f"⏰ <i>Time:</i> <b>{t_str}</b>\n\n"
+        f"⏰ <i>Time:</i> <b>{time_summary}</b>\n\n"
         f"<i>Notifications will be dispatched automatically.</i>"
     )
     if isinstance(update_obj, Update): await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
@@ -2523,8 +2592,9 @@ async def combined_wizard_finalize(update_obj, context):
         run_dt = dt.replace(hour=h, minute=m, second=0)
         notify_dt = run_dt - timedelta(minutes=d['sch_offset'])
         job_id = f"COMBINED_{int(time.time())}_{count}"
+        display_time_str = d.get('sch_time_display', t_str)
         job_data = {
-            "batch": "CSDA & AICS", "subject": sub, "time_display": t_str, 
+            "batch": "CSDA & AICS", "subject": sub, "time_display": display_time_str, 
             "link": d['sch_link'], "manual_msg": d.get('sch_manual_msg'),
             "msg_type": "MANUAL" if d.get('sch_manual_msg') else "AI",
             "message_thread_id": d.get('sch_topic_id')
@@ -2534,6 +2604,7 @@ async def combined_wizard_finalize(update_obj, context):
         count += 1
     
     topic_name = DB.get("topics", {}).get(str(d.get('sch_topic_id')), "General") if d.get('sch_topic_id') else "General"
+    time_summary = _format_time_12h(d.get('sch_time_display', t_str))
     
     msg = (
         f"✅ <b>SCHEDULED SUCCESSFULLY</b>\n"
@@ -2542,7 +2613,7 @@ async def combined_wizard_finalize(update_obj, context):
         f"📌 <i>Subject:</i> <b>{sub}</b>\n"
         f"🎯 <i>Batch:</i> <b>CSDA + AICS</b>\n"
         f"💬 <i>Topic:</i> <b>{topic_name}</b>\n"
-        f"⏰ <i>Time:</i> <b>{t_str}</b>\n\n"
+        f"⏰ <i>Time:</i> <b>{time_summary}</b>\n\n"
         f"<i>Notifications will be dispatched to both batches.</i>"
     )
     if isinstance(update_obj, Update): await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
@@ -2780,12 +2851,10 @@ async def edit_select_job(update, context):
     context.user_data['old_next_t'] = jobs[0].next_t
     
     kb = [
-        [InlineKeyboardButton("⏰ Change Time", callback_data="field_time")],
-        [InlineKeyboardButton("📅 Change Date", callback_data="field_date")],
-        [InlineKeyboardButton("🔗 Change Link", callback_data="field_link")],
-        # Always offered. Previously this only appeared when a manual message
-        # already existed, so an auto-generated class could never be switched
-        # over to custom text.
+        [InlineKeyboardButton("⏰ Change Start Time", callback_data="field_time"),
+         InlineKeyboardButton("⏰ Change End Time", callback_data="field_endtime")],
+        [InlineKeyboardButton("📅 Change Date", callback_data="field_date"),
+         InlineKeyboardButton("🔗 Change Link", callback_data="field_link")],
         [InlineKeyboardButton("📝 Edit Message", callback_data="field_msg")],
         [InlineKeyboardButton("💬 Edit Topic", callback_data="field_topic")],
         [InlineKeyboardButton("🔙 Cancel", callback_data="field_cancel")],
@@ -2869,6 +2938,10 @@ async def _edit_show_scope(context, send, field, new_val):
         shown = ("Auto-generated" if new_val == EDIT_MSG_AUTO
                  else f"Custom · {new_val[:24]}…" if len(new_val) > 24
                  else f"Custom · {new_val}")
+    elif field == "endtime":
+        shown = "None (Removed)" if str(new_val).lower() in ('none', 'skip', 'no', '-') else _format_single_time_12h(new_val)
+    elif field == "time":
+        shown = _format_single_time_12h(new_val)
     else:
         shown = new_val[:30]
 
@@ -2925,10 +2998,11 @@ async def edit_choose_field(update, context):
         return EDIT_MSG_TYPE
 
     prompts = {
-        "time": "⏰ <b>NEW TIME</b>\n<i>Enter HH:MM (24-hour), e.g. 14:30</i>",
-        "date": "📅 <b>NEW DATE</b>\n<i>Enter YYYY-MM-DD</i>",
-        "link": "🔗 <b>NEW LINK</b>\n<i>Paste the new meeting link</i>",
-        "topic": "💬 <b>NEW TOPIC ID</b>\n<i>Enter Topic ID (0 for General)</i>",
+        "time": "⏰ <b>NEW START TIME</b>\n\n<i>Enter HH:MM (24-hour), e.g. <code>14:30</code></i>",
+        "endtime": "⏰ <b>NEW END TIME</b>\n\n<i>Enter HH:MM (24-hour), e.g. <code>15:30</code>\nOr type <code>None</code> to remove end time.</i>",
+        "date": "📅 <b>NEW DATE</b>\n\n<i>Enter YYYY-MM-DD, e.g. <code>2026-08-20</code></i>",
+        "link": "🔗 <b>NEW LINK</b>\n\n<i>Paste the new meeting link (or type <code>None</code>)</i>",
+        "topic": "💬 <b>NEW TOPIC ID</b>\n\n<i>Enter Topic ID (0 for General)</i>",
     }
     await query.edit_message_text(
         prompts.get(field, "❓ Enter new value:"),
@@ -2985,11 +3059,30 @@ async def edit_save(update, context):
             h, m = map(int, new_val.split(":"))
             if not (0 <= h <= 23 and 0 <= m <= 59):
                 raise ValueError
+            new_val = f"{h:02d}:{m:02d}"
         except Exception:
             await update.message.reply_text(
                 "❌ <b>INVALID TIME</b>\n<i>Use HH:MM between 00:00 and 23:59.</i>",
                 parse_mode=ParseMode.HTML)
             return EDIT_NEW_VALUE
+
+    elif field == "endtime":
+        if new_val.lower() in ('none', 'skip', 'no', '-'):
+            new_val = "None"
+        else:
+            try:
+                parts = new_val.split(":")
+                if len(parts) != 2:
+                    raise ValueError
+                h, m = int(parts[0]), int(parts[1])
+                if not (0 <= h <= 23 and 0 <= m <= 59):
+                    raise ValueError
+                new_val = f"{h:02d}:{m:02d}"
+            except Exception:
+                await update.message.reply_text(
+                    "❌ <b>INVALID END TIME</b>\n<i>Use HH:MM (e.g. 15:30) or type None to remove.</i>",
+                    parse_mode=ParseMode.HTML)
+                return EDIT_NEW_VALUE
 
     elif field == "date":
         try:
@@ -3111,7 +3204,28 @@ async def edit_scope_handler(update, context):
             if field == "time":
                 h, m = map(int, new_val.split(":"))
                 next_t = next_t.replace(hour=h, minute=m)
-                data['time_display'] = new_val
+                old_td = str(data.get('time_display', '')).strip()
+                if " - " in old_td:
+                    end_part = old_td.split(" - ", 1)[1]
+                    data['time_display'] = f"{new_val} - {end_part}"
+                elif "-" in old_td and len(old_td.split("-")) == 2:
+                    end_part = old_td.split("-", 1)[1].strip()
+                    data['time_display'] = f"{new_val} - {end_part}"
+                else:
+                    data['time_display'] = new_val
+            elif field == "endtime":
+                old_td = str(data.get('time_display', '')).strip()
+                if " - " in old_td:
+                    start_part = old_td.split(" - ", 1)[0].strip()
+                elif "-" in old_td and len(old_td.split("-")) == 2:
+                    start_part = old_td.split("-", 1)[0].strip()
+                else:
+                    start_part = old_td or next_t.strftime('%H:%M')
+                
+                if new_val.lower() in ('none', 'skip', 'no', '-'):
+                    data['time_display'] = start_part
+                else:
+                    data['time_display'] = f"{start_part} - {new_val}"
             elif field == "date":
                 d = datetime.strptime(new_val, "%Y-%m-%d")
                 next_t = next_t.replace(year=d.year, month=d.month, day=d.day)
@@ -3158,6 +3272,10 @@ async def edit_scope_handler(update, context):
     if field == "msg":
         shown = ("Auto-generated (fresh design each time)"
                  if new_val == EDIT_MSG_AUTO else f"Custom text ({len(new_val)} chars)")
+    elif field == "endtime":
+        shown = "None (Removed)" if str(new_val).lower() in ('none', 'skip', 'no', '-') else _format_single_time_12h(new_val)
+    elif field == "time":
+        shown = _format_single_time_12h(new_val)
     else:
         shown = new_val[:30]
 
@@ -3189,15 +3307,35 @@ async def edit_scope_handler(update, context):
 # ==============================================================================
 
 def _format_time_12h(time_str):
-    """Convert 'HH:MM' (24h) to a readable '3:41 PM'."""
+    """Convert 'HH:MM' or 'HH:MM - HH:MM' (24h) to readable '2:30 PM' or '2:30 PM - 3:30 PM'."""
     try:
-        h, m = str(time_str).strip().split(":")[:2]
+        s = str(time_str).strip()
+        if not s:
+            return ""
+        for sep in (" - ", " to ", " – ", "-"):
+            if sep in s:
+                parts = s.split(sep, 1)
+                t1 = _format_single_time_12h(parts[0])
+                t2 = _format_single_time_12h(parts[1])
+                return f"{t1} - {t2}"
+        return _format_single_time_12h(s)
+    except Exception:
+        return str(time_str)
+
+
+def _format_single_time_12h(time_str):
+    """Convert a single 'HH:MM' (24h) to '2:30 PM'."""
+    try:
+        s = str(time_str).strip()
+        if "AM" in s.upper() or "PM" in s.upper():
+            return s
+        h, m = s.split(":")[:2]
         h, m = int(h), int(m[:2])
         suffix = "AM" if h < 12 else "PM"
         h12 = h % 12 or 12
         return f"{h12}:{m:02d} {suffix}"
     except Exception:
-        return str(time_str)
+        return str(time_str).strip()
 
 
 # ------------------------------------------------------------------------------
@@ -7461,6 +7599,7 @@ def main():
             INPUT_START_DATE: [MessageHandler(txt_filter, wizard_start_date)],
             INPUT_END_DATE: [MessageHandler(txt_filter, wizard_end_date)],
             INPUT_TIME: [MessageHandler(txt_filter, wizard_time)],
+            INPUT_END_TIME: [MessageHandler(txt_filter, wizard_end_time)],
             INPUT_LINK: [MessageHandler(txt_filter, wizard_link)],
             SELECT_TOPIC: [CallbackQueryHandler(wizard_topic_selection, pattern="^topic_")],
             SELECT_OFFSET: [CallbackQueryHandler(wizard_offset, pattern="^offset_")],
@@ -7481,6 +7620,7 @@ def main():
             INPUT_START_DATE: [MessageHandler(txt_filter, wizard_start_date)],
             INPUT_END_DATE: [MessageHandler(txt_filter, wizard_end_date)],
             INPUT_TIME: [MessageHandler(txt_filter, wizard_time)],
+            INPUT_END_TIME: [MessageHandler(txt_filter, wizard_end_time)],
             INPUT_LINK: [MessageHandler(txt_filter, wizard_link)],
             SELECT_TOPIC: [CallbackQueryHandler(wizard_topic_selection, pattern="^topic_")],
             SELECT_OFFSET: [CallbackQueryHandler(wizard_offset, pattern="^offset_")],
