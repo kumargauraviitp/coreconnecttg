@@ -2745,13 +2745,19 @@ async def start_edit(update, context):
         )
         return ConversationHandler.END
     
-    # Sort by time
-    class_jobs.sort(key=lambda j: j.next_t)
+    # Sort by Subject Name first, then by day/time
+    class_jobs.sort(key=lambda j: (
+        safe_job_data(j).get('subject', '').lower(),
+        safe_job_data(j).get('batch', '').lower(),
+        j.next_t if j.next_t else datetime.min.replace(tzinfo=IST)
+    ))
     
     # Pagination - max 8 per page
     PAGE_SIZE = 8
     page = context.user_data.get('edit_page', 0)
-    total_pages = (len(class_jobs) + PAGE_SIZE - 1) // PAGE_SIZE
+    total_pages = max(1, (len(class_jobs) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    context.user_data['edit_page'] = page
     
     start_idx = page * PAGE_SIZE
     end_idx = min(start_idx + PAGE_SIZE, len(class_jobs))
@@ -2760,11 +2766,22 @@ async def start_edit(update, context):
     rows = []
     for job in page_jobs:
         d = safe_job_data(job)
+        sub_name = d.get('subject', 'Class')
+        batch_label = d.get('batch', '?')
+        code, name = _split_subject(sub_name)
+        short_sub = code if code else (name[:14] + "…" if len(name) > 14 else name)
         try:
-            time_str = job.next_t.strftime("%d %b %H:%M")
-        except:
-            time_str = d.get('time_display', '')
-        rows.append([InlineKeyboardButton(f"📖 {d.get('batch','?')} {d.get('subject','?')[:15]} ({time_str})", callback_data=f"edit_{job.name}")])
+            day_str = job.next_t.strftime("%a, %d %b")
+            time_raw = d.get('time_display') or job.next_t.strftime("%H:%M")
+            time_str = _format_time_12h(time_raw)
+        except Exception:
+            day_str = ""
+            time_str = _format_time_12h(d.get('time_display', ''))
+        
+        btn_label = f"📖 [{batch_label}] {short_sub} • {day_str} ({time_str})"
+        if len(btn_label) > 46:
+            btn_label = f"📖 [{batch_label}] {short_sub[:10]} • {day_str[:6]} ({time_str})"
+        rows.append([InlineKeyboardButton(btn_label, callback_data=f"edit_{job.name}")])
     
     # Add navigation buttons if needed
     nav_row = []
@@ -2778,7 +2795,7 @@ async def start_edit(update, context):
     await update.message.reply_text(
         f"✏️ <b>EDIT CLASS</b> ({len(class_jobs)} total)\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Page {page + 1}/{total_pages}</i>\n\n"
+        f"<i>Page {page + 1}/{total_pages} · Sorted by Subject &amp; Days</i>\n\n"
         "<i>Select a class to modify:</i> 👇",
         reply_markup=InlineKeyboardMarkup(rows),
         parse_mode=ParseMode.HTML
@@ -2804,11 +2821,19 @@ async def edit_select_job(update, context):
             d = safe_job_data(j)
             if j.name and d and 'batch' in d and len(f"edit_{j.name}") <= 64:
                 class_jobs.append(j)
-        class_jobs.sort(key=lambda j: j.next_t)
+        
+        # Sort by Subject Name first, then by day/time
+        class_jobs.sort(key=lambda j: (
+            safe_job_data(j).get('subject', '').lower(),
+            safe_job_data(j).get('batch', '').lower(),
+            j.next_t if j.next_t else datetime.min.replace(tzinfo=IST)
+        ))
         
         PAGE_SIZE = 8
         page = context.user_data['edit_page']
-        total_pages = (len(class_jobs) + PAGE_SIZE - 1) // PAGE_SIZE
+        total_pages = max(1, (len(class_jobs) + PAGE_SIZE - 1) // PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        context.user_data['edit_page'] = page
         
         start_idx = page * PAGE_SIZE
         end_idx = min(start_idx + PAGE_SIZE, len(class_jobs))
@@ -2817,11 +2842,22 @@ async def edit_select_job(update, context):
         rows = []
         for job in page_jobs:
             d = safe_job_data(job)
+            sub_name = d.get('subject', 'Class')
+            batch_label = d.get('batch', '?')
+            code, name = _split_subject(sub_name)
+            short_sub = code if code else (name[:14] + "…" if len(name) > 14 else name)
             try:
-                time_str = job.next_t.strftime("%d %b %H:%M")
-            except:
-                time_str = d.get('time_display', '')
-            rows.append([InlineKeyboardButton(f"📖 {d.get('batch','?')} {d.get('subject','?')[:15]} ({time_str})", callback_data=f"edit_{job.name}")])
+                day_str = job.next_t.strftime("%a, %d %b")
+                time_raw = d.get('time_display') or job.next_t.strftime("%H:%M")
+                time_str = _format_time_12h(time_raw)
+            except Exception:
+                day_str = ""
+                time_str = _format_time_12h(d.get('time_display', ''))
+            
+            btn_label = f"📖 [{batch_label}] {short_sub} • {day_str} ({time_str})"
+            if len(btn_label) > 46:
+                btn_label = f"📖 [{batch_label}] {short_sub[:10]} • {day_str[:6]} ({time_str})"
+            rows.append([InlineKeyboardButton(btn_label, callback_data=f"edit_{job.name}")])
         
         nav_row = []
         if page > 0:
@@ -2834,7 +2870,7 @@ async def edit_select_job(update, context):
         await query.edit_message_text(
             f"✏️ <b>EDIT CLASS</b> ({len(class_jobs)} total)\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>Page {page + 1}/{total_pages}</i>\n\n"
+            f"<i>Page {page + 1}/{total_pages} · Sorted by Subject &amp; Days</i>\n\n"
             "<i>Select a class to modify:</i> 👇",
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode=ParseMode.HTML
@@ -4106,12 +4142,8 @@ async def send_alert_job(context: ContextTypes.DEFAULT_TYPE):
         manual = data.get('manual_msg')
 
         if data.get('msg_type') == "AI" or not manual:
-            # Falling back to the generated notification when manual text is
-            # absent. The old code emitted the literal string "None" here.
-            text = await generate_hype_message(_batch, _subject, _time, link)
-            if not text:
-                # ━━━━ RICH TEMPLATE SYSTEM (No AI needed) ━━━━
-                text = _generate_class_notification(_batch, _subject, _time, link)
+            # ━━━━ RICH TEMPLATE SYSTEM (with ASCII Frames & Layout Cards) ━━━━
+            text = _generate_class_notification(_batch, _subject, _time, link)
         else:
             text = str(manual)
         
@@ -5490,7 +5522,7 @@ async def mark_attendance(update, context):
             pass
 
 async def view_schedule_handler(update, context):
-    """View schedule with pagination"""
+    """View schedule grouped by Subject with days & timings"""
     query = None
     if update.callback_query:
         query = update.callback_query
@@ -5501,7 +5533,10 @@ async def view_schedule_handler(update, context):
     # Determine page number
     page = 0
     if query and query.data.startswith("schedule_page_"):
-        page = int(query.data.split("_")[-1])
+        try:
+            page = int(query.data.split("_")[-1])
+        except Exception:
+            page = 0
     
     jobs = context.job_queue.jobs()
     
@@ -5519,33 +5554,56 @@ async def view_schedule_handler(update, context):
             await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         return
     
-    # Sort by time
-    class_jobs.sort(key=lambda j: j.next_t)
+    # Group jobs by (batch, subject)
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    for j in class_jobs:
+        d = safe_job_data(j)
+        key = (d.get('batch', 'Unknown'), d.get('subject', 'Class'))
+        grouped[key].append(j)
     
-    # Pagination Logic
-    PAGE_SIZE = 5
-    total_pages = (len(class_jobs) + PAGE_SIZE - 1) // PAGE_SIZE
-    page = max(0, min(page, total_pages - 1)) # Bounds check
+    # Sort sessions within each subject chronologically
+    for key in grouped:
+        grouped[key].sort(key=lambda j: j.next_t if j.next_t else datetime.min.replace(tzinfo=IST))
+        
+    # Sort the subject groups alphabetically by subject name, then batch
+    sorted_groups = sorted(grouped.items(), key=lambda item: (item[0][1].lower(), item[0][0].lower()))
+    
+    # Paginate by Subject Groups (3 subjects per page)
+    PAGE_SIZE = 3
+    total_pages = max(1, (len(sorted_groups) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
     
     start_idx = page * PAGE_SIZE
-    end_idx = min(start_idx + PAGE_SIZE, len(class_jobs))
-    page_jobs = class_jobs[start_idx:end_idx]
+    end_idx = min(start_idx + PAGE_SIZE, len(sorted_groups))
+    page_groups = sorted_groups[start_idx:end_idx]
     
     msg = (
-        f"📅 <b>UPCOMING CLASSES</b> ({len(class_jobs)} total)\n"
+        f"📅 <b>UPCOMING CLASS SCHEDULE</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Page {page + 1}/{total_pages}</i>\n\n"
+        f"<i>Page {page + 1}/{total_pages} · {len(class_jobs)} total session(s)</i>\n\n"
     )
     
-    for job in page_jobs:
-        d = job.data
-        # Format date nicely
-        try:
-            date_str = job.next_t.strftime("%d %b, %H:%M")
-        except:
-            date_str = d.get('time_display', 'Unknown')
-        msg += f"📖 <b>{d['batch']}</b> • {d['subject']}\n"
-        msg += f"     ⏰ <i>{date_str}</i>\n\n"
+    for (batch, subject), session_jobs in page_groups:
+        batch_chip = ("🟦" if batch == "CSDA" else "🟧" if batch == "AICS" else "🟪")
+        msg += f"📚 <b>{html.escape(subject)}</b>\n"
+        msg += f"🎯 <i>Batch:</i> {batch_chip} <b>{html.escape(batch)}</b> ({len(session_jobs)} session{'s' if len(session_jobs) > 1 else ''})\n"
+        
+        for job in session_jobs:
+            d = safe_job_data(job)
+            try:
+                day_name = job.next_t.strftime("%A")
+                date_str = job.next_t.strftime("%d %b")
+                time_raw = d.get('time_display') or job.next_t.strftime("%H:%M")
+                time_str = _format_time_12h(time_raw)
+            except Exception:
+                day_name = "Scheduled"
+                date_str = ""
+                time_str = _format_time_12h(d.get('time_display', ''))
+                
+            msg += f"  • 🗓 <b>{day_name}</b>, {date_str} — ⏰ <code>{html.escape(time_str)}</code>\n"
+        
+        msg += "\n"
         
     # Navigation Buttons
     buttons = []
@@ -5560,9 +5618,9 @@ async def view_schedule_handler(update, context):
         
     # Send or Edit Message
     if query:
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML)
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None, parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML)
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None, parse_mode=ParseMode.HTML)
 
 async def prompt_image_upload(update, context):
     if not await require_private_admin(update, context): return
@@ -5951,11 +6009,10 @@ async def viewfeedback_handler(update, context):
     )
 
 async def delete_menu(update, context):
-    """Delete classes with pagination - single message UI"""
+    """Delete classes with pagination - sorted by Subject Name & Days"""
     if not await require_private_admin(update, context): return
     jobs = context.job_queue.jobs()
     valid_jobs = [j for j in jobs if j.name and isinstance(j.data, dict) and 'batch' in j.data and len(f"kill_{j.name}") <= 64]
-    valid_jobs.sort(key=lambda j: j.next_t)
     
     if not valid_jobs:
         await update.message.reply_text(
@@ -5964,6 +6021,13 @@ async def delete_menu(update, context):
             parse_mode=ParseMode.HTML
         )
         return
+    
+    # Sort by Subject Name first, then by Day/Time
+    valid_jobs.sort(key=lambda j: (
+        safe_job_data(j).get('subject', '').lower(),
+        safe_job_data(j).get('batch', '').lower(),
+        j.next_t if j.next_t else datetime.min.replace(tzinfo=IST)
+    ))
     
     # Store jobs in context for pagination
     context.user_data['delete_jobs'] = [j.name for j in valid_jobs]
@@ -5977,14 +6041,18 @@ async def show_delete_page(message_or_query, context, valid_jobs=None, edit=Fals
         jobs = context.job_queue.jobs()
         job_names = context.user_data.get('delete_jobs', [])
         valid_jobs = [j for j in jobs if j.name in job_names]
-        valid_jobs.sort(key=lambda j: j.next_t)
+        valid_jobs.sort(key=lambda j: (
+            safe_job_data(j).get('subject', '').lower(),
+            safe_job_data(j).get('batch', '').lower(),
+            j.next_t if j.next_t else datetime.min.replace(tzinfo=IST)
+        ))
     
     PAGE_SIZE = 8
     page = context.user_data.get('delete_page', 0)
     total_pages = max(1, (len(valid_jobs) + PAGE_SIZE - 1) // PAGE_SIZE)
     
     # Ensure page is in bounds
-    page = min(page, total_pages - 1)
+    page = max(0, min(page, total_pages - 1))
     context.user_data['delete_page'] = page
     
     start_idx = page * PAGE_SIZE
@@ -5993,12 +6061,23 @@ async def show_delete_page(message_or_query, context, valid_jobs=None, edit=Fals
     
     rows = []
     for j in page_jobs:
-        d = j.data
+        d = safe_job_data(j)
+        sub_name = d.get('subject', 'Class')
+        batch_label = d.get('batch', '?')
+        code, name = _split_subject(sub_name)
+        short_sub = code if code else (name[:14] + "…" if len(name) > 14 else name)
         try:
-            time_str = j.next_t.strftime("%d %b %H:%M")
-        except:
-            time_str = d.get('time_display', '')
-        rows.append([InlineKeyboardButton(f"❌ {d['batch']} {d['subject'][:12]} ({time_str})", callback_data=f"kill_{j.name}")])
+            day_str = j.next_t.strftime("%a, %d %b")
+            time_raw = d.get('time_display') or j.next_t.strftime("%H:%M")
+            time_str = _format_time_12h(time_raw)
+        except Exception:
+            day_str = ""
+            time_str = _format_time_12h(d.get('time_display', ''))
+        
+        btn_label = f"❌ [{batch_label}] {short_sub} • {day_str} ({time_str})"
+        if len(btn_label) > 46:
+            btn_label = f"❌ [{batch_label}] {short_sub[:10]} • {day_str[:6]} ({time_str})"
+        rows.append([InlineKeyboardButton(btn_label, callback_data=f"kill_{j.name}")])
     
     # Navigation and batch delete
     nav_row = []
@@ -6016,7 +6095,7 @@ async def show_delete_page(message_or_query, context, valid_jobs=None, edit=Fals
     text = (
         f"🗑️ <b>DELETE CLASSES</b> ({len(valid_jobs)} total)\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Page {page + 1}/{total_pages}</i>\n\n"
+        f"<i>Page {page + 1}/{total_pages} · Sorted by Subject &amp; Days</i>\n\n"
         "<i>Tap to delete:</i> 👇"
     )
     
