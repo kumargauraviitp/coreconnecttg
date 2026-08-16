@@ -1716,10 +1716,10 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             
             await context.bot.send_message(
                 chat_id=chat.id,
-                text=f"🤖 <b>VASUKI SYSTEM ONLINE</b>\n"
-                     f"✅ Connected: <b>{chat.title}</b>\n"
-                     f"🕒 Timezone: IST (GMT+5:30)\n"
-                     f"🚀 <b>Ready to schedule classes.</b>",
+                text=f"✅ <b>VASUKI CONNECTED</b>\n"
+                     f"<b>Group:</b> {chat.title}\n"
+                     f"<b>Timezone:</b> IST (GMT+5:30)\n"
+                     f"<i>Use /start in DM to manage scheduling.</i>",
                 parse_mode=ParseMode.HTML
             )
         elif current_group == chat.id:
@@ -1861,12 +1861,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_db()
         try:
             msg = await update.message.reply_text(
-                f"🚀 <b>VASUKI ACTIVATED!</b>\n"
+                f"✅ <b>VASUKI CONNECTED</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"✅ <i>Successfully linked to:</i>\n"
-                f"📍 <b>{update.effective_chat.title}</b>\n\n"
-                f"💡 <i>Use /start in DM for full control!</i>\n\n"
-                f"<i>This message will auto-delete in 1 seconds...</i>",
+                f"<i>Linked to:</i> <b>{update.effective_chat.title}</b>\n\n"
+                f"<i>Use /start in your DM for full admin access.</i>\n\n"
+                f"<i>This message will auto-delete shortly.</i>",
                 parse_mode=ParseMode.HTML,
                 disable_notification=True  # Silent
             )
@@ -1910,17 +1909,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         await update.message.reply_text(
-            f"⚡ <b>VASUKI COMMAND CENTER</b> ⚡\n"
+            f"<b>VASUKI — ADMIN DASHBOARD</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"👋 <i>Welcome back,</i> <b>{user.first_name}!</b>\n\n"
-            f"🔌 <b>CONNECTION STATUS</b>\n"
-            f"┣ 🎯 <b>Target:</b> {group_status} {grp_name}\n"
+            f"<i>Logged in as</i> <b>{user.first_name}</b>\n\n"
+            f"<b>System Status</b>\n"
+            f"┣ 📍 <b>Group:</b> {group_status} {grp_name}\n"
             f"┣ 💬 <b>Topics:</b> {topic_status}\n"
             f"┣ ⏰ <b>Time:</b> {datetime.now(IST).strftime('%H:%M IST')}\n"
-            f"┣ 📅 <b>Scheduled:</b> {len(DB.get('active_jobs', []))} classes\n"
+            f"┣ 📅 <b>Scheduled Classes:</b> {len(DB.get('active_jobs', []))}\n"
             f"┗ 💾 <b>Storage:</b> {'☁️ Supabase' if supabase else '💻 Local'}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>Select an option below to begin!</i> 👇",
+            f"<i>Select an option from the menu below.</i>",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(kb) if kb else get_main_keyboard()
         )
@@ -2074,9 +2073,10 @@ async def handle_navigation(update, context):
 # NEW FEATURE: VIEW ALL SUBJECTS
 async def view_all_subjects(update, context):
     if not await require_private_admin(update, context): return
-    
+    _ensure_db_shape()
     subjects = DB.get("subjects", {})
-    if not subjects or (not subjects.get("CSDA") and not subjects.get("AICS")):
+    # Check if any batch has at least one subject
+    if not subjects or not any(bool(v) for v in subjects.values() if isinstance(v, list)):
         await update.message.reply_text(
             "📭 <b>NO SUBJECTS FOUND!</b>\n\n"
             "<i>Add subjects using</i> ➕ <b>Add Subject</b>",
@@ -2086,12 +2086,12 @@ async def view_all_subjects(update, context):
 
     msg = "📚 <b>REGISTERED SUBJECTS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     for batch, sub_list in subjects.items():
-        if sub_list:
-            msg += f"🏷️ <b>{batch}</b>\n"
+        if isinstance(sub_list, list) and sub_list:
+            msg += f"🏷️ <b>{html.escape(str(batch))}</b>\n"
             for s in sub_list:
-                msg += f"   ├ 📖 {s}\n"
+                msg += f"   ├ 📖 {html.escape(str(s))}\n"
             msg += "\n"
-    
+
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 # ==============================================================================
@@ -2100,7 +2100,7 @@ async def view_all_subjects(update, context):
 async def cancel_wizard(update, context):
     await update.message.reply_text(
         "❌ <b>CANCELLED</b>\n\n"
-        "<i>Operation cancelled. Back to menu!</i> 👋",
+        "<i>Operation cancelled. Use the menu to continue.</i>",
         parse_mode=ParseMode.HTML
     )
     return ConversationHandler.END
@@ -2134,7 +2134,7 @@ async def init_schedule_wizard(update, context):
         f"📚 <b>SELECT SUBJECT</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🎯 <i>Batch:</i> <b>{batch}</b>\n\n"
-        f"<i>Choose a subject below:</i> 👇",
+        f"<i>Select a subject to schedule:</i>",
         reply_markup=InlineKeyboardMarkup(rows),
         parse_mode=ParseMode.HTML
     )
@@ -2146,7 +2146,7 @@ async def wizard_pick_sub(update, context):
     await update.callback_query.edit_message_text(
         "📅 <b>SELECT DAYS</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<i>Tap to toggle days, then hit</i> <b>DONE</b> 🚀",
+        "<i>Tap to toggle days, then press</i> <b>DONE</b> <i>to confirm.</i>",
         reply_markup=days_keyboard([]),
         parse_mode=ParseMode.HTML
     )
@@ -2247,7 +2247,7 @@ async def wizard_link(update, context):
         await update.message.reply_text(
             "💬 <b>SELECT TOPIC</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "<i>Where should this class be posted?</i> 👇",
+            "<i>Select the topic where this class notification should be posted:</i>",
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode=ParseMode.HTML
         )
@@ -2282,7 +2282,7 @@ async def show_offset_selection(update):
     msg_text = (
         "⌛ <b>NOTIFICATION TIMING</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<i>When should I notify before class?</i> 👇"
+        "<i>How far in advance should the notification be sent?</i>"
     )
     
     if hasattr(update, 'callback_query') and update.callback_query:
@@ -2321,7 +2321,7 @@ async def wizard_offset(update, context):
     await query.edit_message_text(
         "📝 <b>MESSAGE STYLE</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<i>How should I announce the class?</i> 👇",
+        "<i>Select how the class announcement should be composed:</i>",
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode=ParseMode.HTML
     )
@@ -2346,8 +2346,8 @@ async def wizard_custom_offset(update, context):
         await update.message.reply_text(
             "📝 <b>MESSAGE STYLE</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"✅ <i>Notification:</i> <b>{mins} mins before</b>\n\n"
-            "<i>How should I announce the class?</i> 👇",
+            f"⏱️ <i>Notification timing:</i> <b>{mins} minutes before class</b>\n\n"
+            "<i>Select how the class announcement should be composed:</i>",
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode=ParseMode.HTML
         )
@@ -2422,14 +2422,14 @@ async def wizard_finalize(update_obj, context):
     topic_name = DB.get("topics", {}).get(str(d.get('sch_topic_id')), "General") if d.get('sch_topic_id') else "General"
     
     msg = (
-        f"🎉 <b>SUCCESS!</b>\n"
+        f"✅ <b>SCHEDULED SUCCESSFULLY</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"✅ <b>{count} class(es) scheduled!</b>\n\n"
+        f"<b>{count} class(es) added to schedule.</b>\n\n"
         f"📌 <i>Subject:</i> <b>{sub}</b>\n"
         f"🎯 <i>Batch:</i> <b>{batch}</b>\n"
         f"💬 <i>Topic:</i> <b>{topic_name}</b>\n"
         f"⏰ <i>Time:</i> <b>{t_str}</b>\n\n"
-        f"<i>Notifications will be sent automatically!</i> 🚀"
+        f"<i>Notifications will be dispatched automatically.</i>"
     )
     if isinstance(update_obj, Update): await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
     else: await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
@@ -2470,8 +2470,7 @@ async def init_combined_schedule_wizard(update, context):
         "📅 <b>SCHEDULE FOR BOTH BATCHES</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "🎯 <i>Batch:</i> <b>CSDA + AICS</b>\n\n"
-        "<i>Select a subject below:</i> 👇\n"
-        "<i>(Will be scheduled for both batches)</i>",
+        "<i>Select a subject. The class will be scheduled for both batches.</i>",
         reply_markup=InlineKeyboardMarkup(rows),
         parse_mode=ParseMode.HTML
     )
@@ -2537,14 +2536,14 @@ async def combined_wizard_finalize(update_obj, context):
     topic_name = DB.get("topics", {}).get(str(d.get('sch_topic_id')), "General") if d.get('sch_topic_id') else "General"
     
     msg = (
-        f"🎉 <b>SUCCESS!</b>\n"
+        f"✅ <b>SCHEDULED SUCCESSFULLY</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"✅ <b>{count} class(es) scheduled!</b>\n\n"
+        f"<b>{count} class(es) added to schedule.</b>\n\n"
         f"📌 <i>Subject:</i> <b>{sub}</b>\n"
         f"🎯 <i>Batch:</i> <b>CSDA + AICS</b>\n"
         f"💬 <i>Topic:</i> <b>{topic_name}</b>\n"
         f"⏰ <i>Time:</i> <b>{t_str}</b>\n\n"
-        f"<i>Notifications will be sent to both batches!</i> 🚀"
+        f"<i>Notifications will be dispatched to both batches.</i>"
     )
     if isinstance(update_obj, Update): await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
     else: await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
@@ -2576,8 +2575,9 @@ async def combined_wizard_manual_msg(update, context):
 async def start_add_sub(update, context):
     if not await require_private_admin(update, context): return ConversationHandler.END
     kb = [
-        [InlineKeyboardButton("🟦 CSDA", callback_data="sub_CSDA"), 
-         InlineKeyboardButton("🟧 AICS", callback_data="sub_AICS")]
+        [InlineKeyboardButton("🟦 CSDA", callback_data="sub_CSDA"),
+         InlineKeyboardButton("🟧 AICS", callback_data="sub_AICS")],
+        [InlineKeyboardButton("🟪 Both (CSDA + AICS)", callback_data="sub_BOTH")]
     ]
     await update.message.reply_text(
         "➕ <b>ADD NEW SUBJECT</b>\n"
@@ -2589,30 +2589,70 @@ async def start_add_sub(update, context):
     return SELECT_BATCH
 
 async def save_batch_for_sub(update, context):
-    context.user_data['temp_batch'] = update.callback_query.data.split("_")[1]
+    # callback_data is "sub_CSDA", "sub_AICS", or "sub_BOTH"
+    # Use split with maxsplit=1 so "BOTH" (one part after prefix) is captured correctly
+    raw = update.callback_query.data  # e.g. "sub_CSDA"
+    context.user_data['temp_batch'] = raw.split("_", 1)[1]  # "CSDA" / "AICS" / "BOTH"
     await update.callback_query.answer()
+    batch_label = context.user_data['temp_batch']
+    if batch_label == "BOTH":
+        batch_display = "CSDA + AICS"
+    else:
+        batch_display = batch_label
     await update.callback_query.edit_message_text(
-        "📝 <b>SUBJECT NAME</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<i>Type the subject name below:</i>",
+        f"📝 <b>SUBJECT NAME</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎯 <i>Batch:</i> <b>{html.escape(batch_display)}</b>\n\n"
+        f"<i>Type the subject name below:</i>",
         parse_mode=ParseMode.HTML
     )
     return NEW_SUBJECT_INPUT
 
 async def save_new_sub(update, context):
-    b = context.user_data['temp_batch']
-    s = update.message.text
-    if s not in DB["subjects"][b]:
-        DB["subjects"][b].append(s)
+    b = context.user_data.get('temp_batch', 'CSDA')
+    s = update.message.text.strip() if update.message.text else ""
+    if not s:
+        await update.message.reply_text(
+            "⚠️ <b>Subject name cannot be empty.</b>\n\n<i>Please type a name.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return NEW_SUBJECT_INPUT
+    _ensure_db_shape()
+    if b == "BOTH":
+        added_to = []
+        for batch_key in ("CSDA", "AICS"):
+            if not isinstance(DB["subjects"].get(batch_key), list):
+                DB["subjects"][batch_key] = []
+            if s not in DB["subjects"][batch_key]:
+                DB["subjects"][batch_key].append(s)
+                added_to.append(batch_key)
         save_db()
-    await update.message.reply_text(
-        f"✅ <b>SUBJECT ADDED!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📖 <b>{s}</b>\n"
-        f"🎯 <i>Batch:</i> <b>{b}</b>\n\n"
-        f"<i>You can now schedule classes for this subject!</i> 🚀",
-        parse_mode=ParseMode.HTML
-    )
+        if added_to:
+            added_str = " &amp; ".join(added_to)
+        else:
+            added_str = "CSDA &amp; AICS (already existed)"
+        await update.message.reply_text(
+            f"✅ <b>SUBJECT ADDED TO BOTH BATCHES</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📖 <b>{html.escape(s)}</b>\n"
+            f"🎯 <i>Batches:</i> <b>{added_str}</b>\n\n"
+            f"<i>This subject is now available for scheduling.</i>",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        if not isinstance(DB["subjects"].get(b), list):
+            DB["subjects"][b] = []
+        if s not in DB["subjects"][b]:
+            DB["subjects"][b].append(s)
+            save_db()
+        await update.message.reply_text(
+            f"✅ <b>SUBJECT ADDED</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📖 <b>{html.escape(s)}</b>\n"
+            f"🎯 <i>Batch:</i> <b>{html.escape(b)}</b>\n\n"
+            f"<i>This subject is now available for scheduling.</i>",
+            parse_mode=ParseMode.HTML
+        )
     return ConversationHandler.END
 
 async def start_edit(update, context):
@@ -4370,13 +4410,13 @@ async def cmsg_finalize(update, context):
         topic_name = DB.get("topics", {}).get(str(topic_id), "General") if topic_id else "General"
         
         await reply_func(
-            f"✅ <b>CUSTOM MESSAGE SCHEDULED!</b>\n"
+            f"✅ <b>CUSTOM MESSAGE SCHEDULED</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📢 <b>Batch:</b> {batch}\n"
             f"💬 <b>Topic:</b> {topic_name}\n"
             f"⏰ <b>Time:</b> {time_str}\n"
-            f"📅 <b>Messages:</b> {count} scheduled\n\n"
-            f"<i>Your announcement will be sent!</i> 🚀",
+            f"📅 <b>Messages queued:</b> {count}\n\n"
+            f"<i>The announcement will be dispatched at the scheduled time.</i>",
             parse_mode=ParseMode.HTML
         )
         return ConversationHandler.END
@@ -5588,10 +5628,10 @@ async def handle_photo(update, context):
         
         save_db()
         await msg.edit_text(
-            f"🎉 <b>AI SCAN COMPLETE!</b>\n"
+            f"✅ <b>AI SCAN COMPLETE</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"✅ <b>{c} classes scheduled!</b>\n\n"
-            f"<i>Check</i> 📅 <b>View Schedule</b> <i>to see them!</i> 🚀",
+            f"<b>{c} classes scheduled from timetable image.</b>\n\n"
+            f"<i>Use</i> 📅 <b>View Schedule</b> <i>to review all entries.</i>",
             parse_mode=ParseMode.HTML
         )
     except Exception as e:
@@ -5609,8 +5649,7 @@ async def start_gemini_tool(update, context):
     await update.message.reply_text(
         "🧠 <b>AI ASSISTANT</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "💬 <i>What would you like me to do?</i>\n\n"
-        "<i>Type your prompt below:</i> 👇",
+        "<i>Enter your prompt below and the AI will generate a response.</i>",
         parse_mode=ParseMode.HTML
     )
     return GEMINI_PROMPT_INPUT
@@ -5689,11 +5728,10 @@ async def feedback_handler(update, context):
         DB["feedback"].append(feedback_entry)
         save_db()
         
-        # Show ANONYMOUS confirmation to user (they think it's anonymous)
+        # Show confirmation to user
         confirmation = (
-            "✅ <b>ANONYMOUS FEEDBACK SENT!</b>\n\n"
-            "<i>Jis Byakti Se aap Sampark Krna Chahte Hai Wo Av So Rhe Hai </i>\n"
-            "<i>Msg 10387447 years me chla jayega 🙏</i>"
+            "✅ <b>FEEDBACK SUBMITTED</b>\n\n"
+            "<i>Thank you! Your feedback has been received and recorded successfully.</i>"
         )
         await update.message.reply_text(confirmation, parse_mode=ParseMode.HTML)
         await mirror_non_admin(context, update, bot_reply=confirmation,
@@ -5708,7 +5746,7 @@ async def feedback_handler(update, context):
     else:
         await update.message.reply_text(
             "📝 <b>ANONYMOUS FEEDBACK</b>\n\n"
-            "<i>Ekdm Secret Rkhne ka re Baba</i>\n\n"
+            "<i>Type /feedback by yourself! Don't Click on feedback poped up during typing.</i>\n\n"
             "<b>Usage:</b> <code>/feedback ke baad ek space dena fir likhna message</code>",
             parse_mode=ParseMode.HTML
         )
@@ -6116,11 +6154,10 @@ async def confirm_reset_db(update, context):
         )
         
         await query.edit_message_text(
-            "💥 <b>DATABASE WIPED!</b>\n"
+            "✅ <b>DATABASE RESET COMPLETE</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "✅ <i>All data has been reset to factory defaults.</i>\n"
-            "✅ <i>Admins and Group link preserved.</i>\n\n"
-            "🚀 <i>Ready for a fresh start!</i>",
+            "<i>All data has been reset to factory defaults.</i>\n"
+            "<i>Admin list and group link have been preserved.</i>",
             parse_mode=ParseMode.HTML
         )
         return ConversationHandler.END
@@ -6135,8 +6172,17 @@ def _subject_list(batch):
     DB["subjects"] can be None after an import whose JSON had "subjects": null,
     and the batch key itself may be missing or hold a non-list. Reading it
     directly is what produced "'NoneType' object has no attribute 'get'".
+
+    When batch == "BOTH", returns a deduplicated union of CSDA + AICS subjects.
+    This is a *view* — edits to the returned list will NOT propagate back;
+    callers that mutate must handle BOTH explicitly.
     """
     _ensure_db_shape()
+    if batch == "BOTH":
+        csda = DB["subjects"].get("CSDA") or []
+        aics = DB["subjects"].get("AICS") or []
+        # Deduplicated union, CSDA order first
+        return list(dict.fromkeys(csda + [s for s in aics if s not in csda]))
     subs = DB["subjects"].get(batch)
     if not isinstance(subs, list):
         subs = []
@@ -6167,6 +6213,7 @@ async def start_edit_subject(update, context):
     kb = [
         [InlineKeyboardButton("🟦 CSDA", callback_data="esub_batch_CSDA"),
          InlineKeyboardButton("🟧 AICS", callback_data="esub_batch_AICS")],
+        [InlineKeyboardButton("🟪 Both (CSDA + AICS)", callback_data="esub_batch_BOTH")],
         [InlineKeyboardButton("🔙 Cancel", callback_data="esub_cancel")]
     ]
     await update.message.reply_text(
@@ -6188,20 +6235,29 @@ async def edit_sub_select_batch(update, context):
         await query.edit_message_text("❌ Cancelled.")
         return ConversationHandler.END
 
+    # callback_data format: "esub_batch_CSDA" / "esub_batch_AICS" / "esub_batch_BOTH"
     parts = query.data.split("_", 2)
     if len(parts) < 3:
         return await _esub_expired(query)
-    batch = parts[2]
+    batch = parts[2]  # "CSDA", "AICS", or "BOTH"
     context.user_data['esub_batch'] = batch
 
-    subs = _subject_list(batch)
+    subs = _subject_list(batch)  # handles BOTH automatically
     if not subs:
+        batch_display = "CSDA + AICS" if batch == "BOTH" else batch
         await query.edit_message_text(
-            f"⚠️ <b>NO SUBJECTS IN {html.escape(batch)}</b>\n\n"
-            f"<i>Add a subject first, then come back.</i>",
+            f"⚠️ <b>NO SUBJECTS IN {html.escape(batch_display)}</b>\n\n"
+            f"<i>Add a subject first using</i> ➕ <b>Add Subject</b><i>, then come back.</i>",
             parse_mode=ParseMode.HTML
         )
         return ConversationHandler.END
+
+    # Store the combined list so indices remain stable during the wizard session
+    # (the BOTH list is computed fresh here and frozen into user_data).
+    if batch == "BOTH":
+        context.user_data['esub_both_subs'] = list(subs)
+
+    batch_display = "CSDA + AICS" if batch == "BOTH" else batch
 
     # Index-based callback data: subject names can exceed Telegram's 64-byte
     # callback_data limit and may contain the '_' used as a delimiter.
@@ -6210,7 +6266,7 @@ async def edit_sub_select_batch(update, context):
     rows.append([InlineKeyboardButton("🔙 Cancel", callback_data="esub_cancel")])
 
     await query.edit_message_text(
-        f"✏️ <b>EDIT SUBJECT ({html.escape(batch)})</b>\n"
+        f"✏️ <b>EDIT SUBJECT ({html.escape(batch_display)})</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<i>Select a subject to modify:</i> 👇",
         reply_markup=InlineKeyboardMarkup(rows),
@@ -6232,7 +6288,12 @@ async def edit_sub_select_subject(update, context):
     if not batch:
         return await _esub_expired(query)
 
-    subs = _subject_list(batch)
+    # For BOTH, use the frozen list captured when the batch was selected so that
+    # indices don't shift if the DB is modified concurrently.
+    if batch == "BOTH":
+        subs = context.user_data.get('esub_both_subs') or _subject_list("BOTH")
+    else:
+        subs = _subject_list(batch)
     try:
         idx = int(query.data.rsplit("_", 1)[1])
         sub = subs[idx]
@@ -6240,6 +6301,7 @@ async def edit_sub_select_subject(update, context):
         return await _esub_expired(query)
 
     context.user_data['esub_subject'] = sub
+    batch_display = "CSDA + AICS" if batch == "BOTH" else batch
 
     kb = [
         [InlineKeyboardButton("✏️ Rename", callback_data="esub_rename")],
@@ -6250,6 +6312,7 @@ async def edit_sub_select_subject(update, context):
     await query.edit_message_text(
         f"🛠️ <b>MANAGE: {html.escape(sub)}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎯 <i>Batch:</i> <b>{html.escape(batch_display)}</b>\n\n"
         f"<i>What would you like to do?</i>",
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode=ParseMode.HTML
@@ -6273,28 +6336,53 @@ async def edit_sub_action(update, context):
         return await _esub_expired(query)
 
     if action == "esub_delete":
-        subs = _subject_list(batch)
-        if sub in subs:
-            subs.remove(sub)
+        if batch == "BOTH":
+            # Remove from both CSDA and AICS
+            removed_from = []
+            for batch_key in ("CSDA", "AICS"):
+                subs_list = _subject_list(batch_key)
+                if sub in subs_list:
+                    subs_list.remove(sub)
+                    removed_from.append(batch_key)
             save_db()
-            await query.edit_message_text(
-                f"🗑️ <b>DELETED</b>\n\n"
-                f"<i>{html.escape(sub)} was removed from {html.escape(batch)}.</i>",
-                parse_mode=ParseMode.HTML
-            )
+            if removed_from:
+                removed_str = " &amp; ".join(removed_from)
+                await query.edit_message_text(
+                    f"🗑️ <b>DELETED FROM BOTH BATCHES</b>\n\n"
+                    f"<i>{html.escape(sub)} was removed from {removed_str}.</i>",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await query.edit_message_text(
+                    f"⚠️ <b>ALREADY GONE</b>\n\n"
+                    f"<i>{html.escape(sub)} was not found in CSDA or AICS.</i>",
+                    parse_mode=ParseMode.HTML
+                )
         else:
-            await query.edit_message_text(
-                f"⚠️ <b>ALREADY GONE</b>\n\n"
-                f"<i>{html.escape(sub)} is no longer in {html.escape(batch)}.</i>",
-                parse_mode=ParseMode.HTML
-            )
+            subs = _subject_list(batch)
+            if sub in subs:
+                subs.remove(sub)
+                save_db()
+                await query.edit_message_text(
+                    f"🗑️ <b>DELETED</b>\n\n"
+                    f"<i>{html.escape(sub)} was removed from {html.escape(batch)}.</i>",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await query.edit_message_text(
+                    f"⚠️ <b>ALREADY GONE</b>\n\n"
+                    f"<i>{html.escape(sub)} is no longer in {html.escape(batch)}.</i>",
+                    parse_mode=ParseMode.HTML
+                )
         return ConversationHandler.END
 
     if action == "esub_rename":
+        batch_display = "CSDA + AICS" if batch == "BOTH" else batch
         await query.edit_message_text(
             f"✍️ <b>RENAME SUBJECT</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"<b>Current:</b> {html.escape(sub)}\n\n"
+            f"<b>Current:</b> {html.escape(sub)}\n"
+            f"🎯 <i>Batch:</i> <b>{html.escape(batch_display)}</b>\n\n"
             f"<i>Send the new name, or /cancel to abort.</i>",
             parse_mode=ParseMode.HTML
         )
@@ -6330,6 +6418,47 @@ async def edit_sub_save_rename(update, context):
         await update.message.reply_text("⚠️ That is the same name as before.")
         return ConversationHandler.END
 
+    if batch == "BOTH":
+        # Rename in both CSDA and AICS where the old name exists
+        renamed_in = []
+        conflict_in = []
+        for batch_key in ("CSDA", "AICS"):
+            subs_list = _subject_list(batch_key)
+            if new_name in subs_list and new_name != old_name:
+                conflict_in.append(batch_key)
+        if conflict_in:
+            conflict_str = " &amp; ".join(conflict_in)
+            await update.message.reply_text(
+                f"⚠️ <b>{html.escape(new_name)}</b> already exists in "
+                f"{conflict_str}.\n\n<i>Pick a different name.</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return EDIT_SUB_NEW_NAME
+        for batch_key in ("CSDA", "AICS"):
+            subs_list = _subject_list(batch_key)
+            if old_name in subs_list:
+                subs_list[subs_list.index(old_name)] = new_name
+                renamed_in.append(batch_key)
+        save_db()
+        if renamed_in:
+            renamed_str = " &amp; ".join(renamed_in)
+            await update.message.reply_text(
+                f"✅ <b>RENAMED IN BOTH BATCHES</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"{html.escape(old_name)}\n"
+                f"➡️ <b>{html.escape(new_name)}</b>\n"
+                f"🎯 <i>Updated in:</i> <b>{renamed_str}</b>\n\n"
+                f"<i>Existing scheduled classes keep their old label.</i>",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await update.message.reply_text(
+                f"⚠️ <b>{html.escape(old_name)}</b> was not found in CSDA or AICS. Nothing was changed.",
+                parse_mode=ParseMode.HTML
+            )
+        return ConversationHandler.END
+
+    # Single-batch rename
     subs = _subject_list(batch)
     if new_name in subs:
         await update.message.reply_text(
@@ -6527,6 +6656,7 @@ async def post_init(app):
         BotCommand("admin", "🛠️ Admin Tools"),
         BotCommand("schedule", "📅 View Schedule"),
         BotCommand("subjects", "📚 All Subjects"),
+        BotCommand("addsubject", "➕ Add Subject"),
         BotCommand("editsubject", "✏️ Edit Subjects"),
         BotCommand("topics", "💬 View Topics"),
         BotCommand("edittopic", "✏️ Edit Topic"),
@@ -7094,11 +7224,10 @@ async def login_command(update, context):
         )
 
         await update.message.reply_text(
-            "✅ <b>ACCESS GRANTED!</b>\n"
+            "✅ <b>ACCESS GRANTED</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"👤 <b>Welcome, {html.escape(safe_text(user.first_name, 'admin'))}!</b>\n"
-            "<i>You are now an authenticated admin.</i>\n\n"
-            "🚀 <b>TYPE /start TO BEGIN!</b>",
+            f"<b>{html.escape(safe_text(user.first_name, 'Admin'))}</b>, you are now authenticated.\n"
+            "<i>Use /start to open the admin dashboard.</i>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -7286,12 +7415,18 @@ def main():
     txt_filter = filters.TEXT & ~filters.Regex(MENU_REGEX)
 
     app.add_handler(ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^➕ Add Subject"), start_add_sub)],
+        entry_points=[
+            MessageHandler(filters.Regex("^➕ Add Subject"), start_add_sub),
+            CommandHandler("addsubject", start_add_sub),
+        ],
         states={
             SELECT_BATCH: [CallbackQueryHandler(save_batch_for_sub, pattern="^sub_")],
             NEW_SUBJECT_INPUT: [MessageHandler(txt_filter, save_new_sub)]
         },
-        fallbacks=[MessageHandler(filters.Regex(MENU_REGEX), cancel_wizard)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_wizard),
+            MessageHandler(filters.Regex(MENU_REGEX), cancel_wizard),
+        ],
         conversation_timeout=300
     ))
 
