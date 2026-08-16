@@ -225,7 +225,11 @@ else:
 DEFAULT_DB = {
     "config": {
         "group_id": int(ENV_GROUP_ID) if ENV_GROUP_ID else None,
-        "group_name": "Linked via Env Var" if ENV_GROUP_ID else "❌ No Group Linked"
+        "group_name": "Linked via Env Var" if ENV_GROUP_ID else "❌ No Group Linked",
+        # Forum topic every scheduled class alert lands in unless the class
+        # carries its own override. Set with /classtopic from inside the topic.
+        "class_topic_id": None,
+        "class_topic_name": None
     },
     "subjects": {
         "CSDA": [], 
@@ -288,6 +292,8 @@ def _ensure_db_shape():
 
     DB["config"].setdefault("group_id", int(ENV_GROUP_ID) if ENV_GROUP_ID else None)
     DB["config"].setdefault("group_name", "❌ No Group Linked")
+    DB["config"].setdefault("class_topic_id", None)
+    DB["config"].setdefault("class_topic_name", None)
     for b in ("CSDA", "AICS"):
         if not isinstance(DB["subjects"].get(b), list):
             DB["subjects"][b] = []
@@ -660,8 +666,9 @@ def cleanup_old_data(context=None):
     EDIT_SUB_SELECT_BATCH, EDIT_SUB_SELECT_SUBJECT, EDIT_SUB_ACTION, EDIT_SUB_NEW_NAME,
     RESET_CONFIRM, EDIT_TOPIC_SELECT, EDIT_TOPIC_NEW_NAME, DELETE_TOPIC_CONFIRM,
     EDIT_SELECT_SCOPE, EDIT_BULK_DAYS,
-    COMBINED_SELECT_SUB, EDIT_MSG_TYPE
-) = range(43)
+    COMBINED_SELECT_SUB, EDIT_MSG_TYPE,
+    EDIT_SELECT_BATCH, EDIT_SELECT_SUBJECT
+) = range(45)
 
 # Regex to match any menu button for canceling wizards
 MENU_REGEX = "^(📸 AI Auto-Schedule|🧠 Custom AI|🟦 Schedule CSDA|🟧 Schedule AICS|📅 Schedule Classes|📝 Custom Message|➕ Add Subject|📂 More Options|✏️ Edit Class|🗑️ Delete Class|📅 View Schedule|📊 Attendance|📚 All Subjects|📤 Export Data|📥 Import Data|👥 Manage Admins|💬 Manage Topics|🛠️ Admin Tools|🔙 Back to Main|🌙 Night Schedule|☁️ Force Save|🔄 Reset System|🗑️ Remove Topic|➕ Add Topic Manual|📋 List Topics|👤 Add Admin|🗑️ Remove Admin|📋 View Admins)$"
@@ -723,6 +730,81 @@ def safe_job_data(job):
     if job and hasattr(job, 'data') and isinstance(job.data, dict):
         return job.data
     return {}
+
+
+# ------------------------------------------------------------------------------
+# #️⃣ CLASS TOPIC RESOLUTION
+# ------------------------------------------------------------------------------
+# Three distinct intentions have to survive a JSON round-trip through Supabase,
+# so 'message_thread_id' in job data is deliberately tri-state:
+#
+#   None        -> "inherit": use whatever /classtopic points at right now.
+#                  Every job scheduled before /classtopic existed is also None,
+#                  so old jobs pick the default up for free.
+#   GENERAL_TOPIC -> "explicitly General": the admin chose no topic on purpose,
+#                  and the default must NOT override that.
+#   <int>       -> a specific topic, chosen per-class in the wizard.
+#
+# Nothing outside _resolve_thread_id may pass the raw value to Telegram — the
+# sentinel is a string and the API expects an int or nothing.
+GENERAL_TOPIC = "GENERAL"
+
+
+def get_class_topic():
+    """(id, name) of the configured default class topic, or (None, None)."""
+    cfg = DB.get("config", {}) if isinstance(DB.get("config"), dict) else {}
+    tid = cfg.get("class_topic_id")
+    if tid in (None, "", 0):
+        return None, None
+    try:
+        tid = int(tid)
+    except (TypeError, ValueError):
+        return None, None
+    name = cfg.get("class_topic_name") or DB.get("topics", {}).get(str(tid)) or f"Topic {tid}"
+    return tid, name
+
+
+def _clear_class_topic_if(tid):
+    """
+    Drop the class-topic default when that topic is deleted.
+
+    Leaving a dangling id behind would point every class alert at a thread that
+    no longer exists — recoverable (send_alert_job falls back to General) but it
+    would prefix every notification with "Topic unavailable".
+    Returns a note to append to the caller's reply, or "".
+    """
+    current = DB.get("config", {}).get("class_topic_id")
+    if current is not None and str(current) == str(tid):
+        DB["config"]["class_topic_id"] = None
+        DB["config"]["class_topic_name"] = None
+        return "\n\n⚠️ <i>That was the class-alert topic — alerts now go to General.</i>"
+    return ""
+
+
+def _topic_label(stored):
+    """Human-readable destination for a stored topic intention."""
+    tid = _resolve_thread_id({'message_thread_id': stored})
+    if not tid:
+        return "General"
+    return (DB.get("topics", {}).get(str(tid))
+            or get_class_topic()[1]
+            or f"Topic {tid}")
+
+
+def _resolve_thread_id(data):
+    """Turn a job's stored topic intention into a value Telegram accepts."""
+    tid = data.get('message_thread_id') if isinstance(data, dict) else None
+
+    if isinstance(tid, str) and tid.strip().upper() == GENERAL_TOPIC:
+        return None
+    if tid is None:
+        return get_class_topic()[0]
+    try:
+        tid = int(tid)
+    except (TypeError, ValueError):
+        return get_class_topic()[0]
+    # 0 is not a valid thread id; older builds used it to mean General.
+    return tid or None
 
 def safe_text(text, default=""):
     """
@@ -1949,7 +2031,7 @@ async def verify_topics_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def verify_topics_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle pagination callbacks for verify topics"""
-    # Same class of exposure as handle_kill: global handler, spoofable data.
+    # Same class of exposure as delete_nav: global handler, spoofable data.
     # This one leaks the linked group ID, every topic ID and the job count.
     if not await require_admin_callback(update, context): return
     query = update.callback_query
@@ -2300,8 +2382,15 @@ async def wizard_link(update, context):
     
     # Check for topics
     topics = DB.get("topics", {})
+    default_tid, default_name = get_class_topic()
+
     if topics:
         kb = []
+        # The default set by /classtopic goes first, so the common case is one
+        # tap and per-class overrides stay available underneath.
+        if default_tid:
+            kb.append([InlineKeyboardButton(
+                f"⭐ Use Default ({default_name})", callback_data="topic_default")])
         row = []
         for tid, name in topics.items():
             row.append(InlineKeyboardButton(name, callback_data=f"topic_{tid}"))
@@ -2310,17 +2399,20 @@ async def wizard_link(update, context):
                 row = []
         if row: kb.append(row)
         kb.append([InlineKeyboardButton("📢 General (No Topic)", callback_data="topic_general")])
-        
+
+        hint = (f"<i>Default is</i> <b>{html.escape(str(default_name))}</b>"
+                f" <i>(set with /classtopic).</i>\n\n" if default_tid else "")
         await update.message.reply_text(
             "💬 <b>SELECT TOPIC</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{hint}"
             "<i>Select the topic where this class notification should be posted:</i>",
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode=ParseMode.HTML
         )
         return SELECT_TOPIC
     else:
-        # No topics, skip to offset
+        # No topics registered — inherit whatever /classtopic points at.
         context.user_data['sch_topic_id'] = None
         return await show_offset_selection(update)
 
@@ -2328,13 +2420,20 @@ async def wizard_topic_selection(update, context):
     query = update.callback_query
     await query.answer()
     data = query.data
-    
-    if data == "topic_general":
+
+    if data == "topic_default":
+        # None means "inherit", so the class follows /classtopic even if it
+        # changes later.
         context.user_data['sch_topic_id'] = None
+    elif data == "topic_general":
+        context.user_data['sch_topic_id'] = GENERAL_TOPIC
     else:
         tid = data.replace("topic_", "")
-        context.user_data['sch_topic_id'] = int(tid)
-        
+        try:
+            context.user_data['sch_topic_id'] = int(tid)
+        except ValueError:
+            context.user_data['sch_topic_id'] = None
+
     return await show_offset_selection(update)
 
 async def show_offset_selection(update):
@@ -2487,7 +2586,7 @@ async def wizard_finalize(update_obj, context):
         add_job_to_db(job_id, notify_dt.timestamp(), gid, job_data)
         count += 1
     
-    topic_name = DB.get("topics", {}).get(str(d.get('sch_topic_id')), "General") if d.get('sch_topic_id') else "General"
+    topic_name = _topic_label(d.get('sch_topic_id'))
     time_summary = _format_time_12h(d.get('sch_time_display', t_str))
     
     msg = (
@@ -2603,7 +2702,7 @@ async def combined_wizard_finalize(update_obj, context):
         add_job_to_db(job_id, notify_dt.timestamp(), gid, job_data)
         count += 1
     
-    topic_name = DB.get("topics", {}).get(str(d.get('sch_topic_id')), "General") if d.get('sch_topic_id') else "General"
+    topic_name = _topic_label(d.get('sch_topic_id'))
     time_summary = _format_time_12h(d.get('sch_time_display', t_str))
     
     msg = (
@@ -2726,17 +2825,181 @@ async def save_new_sub(update, context):
         )
     return ConversationHandler.END
 
-async def start_edit(update, context):
-    if not await require_private_admin(update, context): return ConversationHandler.END
-    jobs = context.job_queue.jobs()
-    
-    # Filter valid class jobs
-    class_jobs = []
+# ==============================================================================
+# 🧭 CLASS BROWSER — SHARED BATCH ▸ SUBJECT ▸ SESSION NAVIGATION
+# ==============================================================================
+# Edit, Delete and View Schedule all used to dump every scheduled session into
+# one flat paginated list, with subject, batch, day and time crammed into a
+# single truncated button label. Past ~15 classes that is unreadable.
+#
+# These helpers build the same three-level drill-down for all three features, so
+# the navigation is learned once. Callback data carries INDEXES, never job names
+# or subject text: it keeps every callback comfortably under Telegram's 64-byte
+# cap, and it stops the job name being echoed into button data (the old
+# "kill_<job name>" scheme published the exact string needed to delete a class
+# to anyone who could see the keyboard).
+
+CLASS_NAV_PAGE_SIZE = 8
+
+# key, chip, label. Order is the order shown.
+BATCH_VIEWS = (
+    ("csda", "🟦", "CSDA"),
+    ("aics", "🟧", "AICS"),
+    ("both", "🟪", "Both / Shared"),
+    ("all",  "📋", "All Batches"),
+)
+
+
+def _batch_kind(batch):
+    """
+    Bucket a stored batch string into one of the picker's views.
+
+    Batch text is not a clean enum: the combined wizard writes "CSDA & AICS",
+    the custom-message wizard writes "BOTH", and the timetable scanner writes
+    whatever the vision model produced. Classify on content instead of equality.
+    """
+    b = str(batch or "").strip().upper()
+    has_csda, has_aics = "CSDA" in b, "AICS" in b
+    if b in ("BOTH", "ALL", "COMBINED") or (has_csda and has_aics):
+        return "both"
+    if has_csda:
+        return "csda"
+    if has_aics:
+        return "aics"
+    return "other"
+
+
+def _job_sort_key(job):
+    d = safe_job_data(job)
+    return (
+        str(d.get('subject') or '').lower(),
+        str(d.get('batch') or '').lower(),
+        job.next_t if job.next_t else datetime.min.replace(tzinfo=IST),
+    )
+
+
+def _collect_class_jobs(context):
+    """Every schedulable class/message job, sorted by subject then batch then time.
+
+    safe_job_data matters here: job_queue.jobs() also returns internal jobs
+    (cleanup, keep-alive, night summary) created with data=None.
+    """
+    out = []
+    for j in context.job_queue.jobs():
+        d = safe_job_data(j)
+        if j.name and d and 'batch' in d:
+            out.append(j)
+    out.sort(key=_job_sort_key)
+    return out
+
+
+def _jobs_for_view(jobs, view):
+    if view == "all":
+        return list(jobs)
+    return [j for j in jobs if _batch_kind(safe_job_data(j).get('batch')) == view]
+
+
+def _subject_groups(jobs):
+    """
+    [(subject, batch, [jobs])] sorted by subject, sessions sorted by time.
+
+    Grouped by subject AND batch, not subject alone: the edit/delete scope steps
+    match on both, so a subject taught separately to each batch has to stay two
+    separate rows or "apply to all" would silently reach across batches.
+    """
+    grouped = {}
     for j in jobs:
         d = safe_job_data(j)
-        if j.name and d and 'batch' in d and len(f"edit_{j.name}") <= 64:
-            class_jobs.append(j)
-    
+        key = (str(d.get('subject') or 'Class'), str(d.get('batch') or '—'))
+        grouped.setdefault(key, []).append(j)
+    for sessions in grouped.values():
+        sessions.sort(key=lambda x: x.next_t if x.next_t else datetime.min.replace(tzinfo=IST))
+    return [
+        (subject, batch, sessions)
+        for (subject, batch), sessions in sorted(
+            grouped.items(), key=lambda i: (i[0][0].lower(), i[0][1].lower())
+        )
+    ]
+
+
+def _batch_chip(batch):
+    kind = _batch_kind(batch)
+    for key, chip, _ in BATCH_VIEWS:
+        if key == kind:
+            return chip
+    return "🟪"
+
+
+def _view_label(view):
+    for key, chip, label in BATCH_VIEWS:
+        if key == view:
+            return f"{chip} {label}"
+    return "📋 All Batches"
+
+
+def _short_subject(subject, limit=24):
+    """Course code if there is one, else a trimmed subject name."""
+    code, name = _split_subject(subject)
+    label = code or name or "Class"
+    return label if len(label) <= limit else label[:limit - 1] + "…"
+
+
+def _session_bits(job):
+    """(day label, formatted time) for one session, never raising."""
+    d = safe_job_data(job)
+    try:
+        day_str = job.next_t.strftime("%a, %d %b")
+        time_raw = d.get('time_display') or job.next_t.strftime("%H:%M")
+    except Exception:
+        day_str = ""
+        time_raw = d.get('time_display', '')
+    return day_str, _format_time_12h(time_raw)
+
+
+def _paginate(items, page):
+    total = max(1, (len(items) + CLASS_NAV_PAGE_SIZE - 1) // CLASS_NAV_PAGE_SIZE)
+    page = max(0, min(int(page or 0), total - 1))
+    start = page * CLASS_NAV_PAGE_SIZE
+    return items[start:start + CLASS_NAV_PAGE_SIZE], page, total
+
+
+def _batch_picker_rows(jobs, prefix):
+    """Level-1 rows. Empty batches are hidden; 'All' is always offered."""
+    rows = []
+    for key, chip, label in BATCH_VIEWS:
+        count = len(_jobs_for_view(jobs, key))
+        if key != "all" and count == 0:
+            continue
+        rows.append([InlineKeyboardButton(
+            f"{chip} {label} ({count})", callback_data=f"{prefix}b_{key}"
+        )])
+    return rows
+
+
+def _nav_row(prefix, kind, page, total):
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"{prefix}pg{kind}_{page - 1}"))
+    if page < total - 1:
+        row.append(InlineKeyboardButton("➡️ Next", callback_data=f"{prefix}pg{kind}_{page + 1}"))
+    return row
+
+
+def _crumb(title, view=None, subject=None):
+    """Breadcrumb header so the current depth is always visible."""
+    parts = [title]
+    if view:
+        parts.append(_view_label(view))
+    if subject:
+        parts.append(html.escape(_short_subject(subject, 28)))
+    return " › ".join(parts)
+
+
+async def start_edit(update, context):
+    """Level 1 of the edit browser: pick a batch."""
+    if not await require_private_admin(update, context): return ConversationHandler.END
+
+    class_jobs = _collect_class_jobs(context)
     if not class_jobs:
         await update.message.reply_text(
             "📭 <b>NO CLASSES FOUND!</b>\n\n"
@@ -2744,171 +3007,242 @@ async def start_edit(update, context):
             parse_mode=ParseMode.HTML
         )
         return ConversationHandler.END
-    
-    # Sort by Subject Name first, then by day/time
-    class_jobs.sort(key=lambda j: (
-        safe_job_data(j).get('subject', '').lower(),
-        safe_job_data(j).get('batch', '').lower(),
-        j.next_t if j.next_t else datetime.min.replace(tzinfo=IST)
-    ))
-    
-    # Pagination - max 8 per page
-    PAGE_SIZE = 8
-    page = context.user_data.get('edit_page', 0)
-    total_pages = max(1, (len(class_jobs) + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = max(0, min(page, total_pages - 1))
-    context.user_data['edit_page'] = page
-    
-    start_idx = page * PAGE_SIZE
-    end_idx = min(start_idx + PAGE_SIZE, len(class_jobs))
-    page_jobs = class_jobs[start_idx:end_idx]
-    
-    rows = []
-    for job in page_jobs:
-        d = safe_job_data(job)
-        sub_name = d.get('subject', 'Class')
-        batch_label = d.get('batch', '?')
-        code, name = _split_subject(sub_name)
-        short_sub = code if code else (name[:14] + "…" if len(name) > 14 else name)
-        try:
-            day_str = job.next_t.strftime("%a, %d %b")
-            time_raw = d.get('time_display') or job.next_t.strftime("%H:%M")
-            time_str = _format_time_12h(time_raw)
-        except Exception:
-            day_str = ""
-            time_str = _format_time_12h(d.get('time_display', ''))
-        
-        btn_label = f"📖 [{batch_label}] {short_sub} • {day_str} ({time_str})"
-        if len(btn_label) > 46:
-            btn_label = f"📖 [{batch_label}] {short_sub[:10]} • {day_str[:6]} ({time_str})"
-        rows.append([InlineKeyboardButton(btn_label, callback_data=f"edit_{job.name}")])
-    
-    # Add navigation buttons if needed
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data="edit_page_prev"))
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("➡️ Next", callback_data="edit_page_next"))
-    if nav_row:
-        rows.append(nav_row)
-    
+
+    context.user_data.pop('edit_view', None)
+    context.user_data.pop('edit_sub_idx', None)
+
+    rows = _batch_picker_rows(class_jobs, "edit_")
+    rows.append([InlineKeyboardButton("🔙 Cancel", callback_data="edit_cancel")])
+
     await update.message.reply_text(
-        f"✏️ <b>EDIT CLASS</b> ({len(class_jobs)} total)\n"
+        f"✏️ <b>EDIT CLASS</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Page {page + 1}/{total_pages} · Sorted by Subject &amp; Days</i>\n\n"
-        "<i>Select a class to modify:</i> 👇",
+        f"<i>{len(class_jobs)} scheduled session(s)</i>\n\n"
+        "<i>Select a batch to manage:</i> 👇",
+        reply_markup=InlineKeyboardMarkup(rows),
+        parse_mode=ParseMode.HTML
+    )
+    return EDIT_SELECT_BATCH
+
+
+async def _edit_render_batches(query, context, class_jobs):
+    rows = _batch_picker_rows(class_jobs, "edit_")
+    rows.append([InlineKeyboardButton("🔙 Cancel", callback_data="edit_cancel")])
+    await query.edit_message_text(
+        f"✏️ <b>EDIT CLASS</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>{len(class_jobs)} scheduled session(s)</i>\n\n"
+        "<i>Select a batch to manage:</i> 👇",
+        reply_markup=InlineKeyboardMarkup(rows),
+        parse_mode=ParseMode.HTML
+    )
+    return EDIT_SELECT_BATCH
+
+
+async def _edit_render_subjects(query, context, class_jobs):
+    """Level 2: subjects inside the chosen batch view."""
+    view = context.user_data.get('edit_view', 'all')
+    view_jobs = _jobs_for_view(class_jobs, view)
+    groups = _subject_groups(view_jobs)
+
+    if not groups:
+        return await _edit_render_batches(query, context, class_jobs)
+
+    page_items, page, total_pages = _paginate(groups, context.user_data.get('edit_sub_page', 0))
+    context.user_data['edit_sub_page'] = page
+    offset = page * CLASS_NAV_PAGE_SIZE
+
+    rows = []
+    for i, (subject, batch, sessions) in enumerate(page_items):
+        chip = _batch_chip(batch) if view == "all" else "📖"
+        label = f"{chip} {_short_subject(subject, 22)} ({len(sessions)})"
+        rows.append([InlineKeyboardButton(label, callback_data=f"edit_s_{offset + i}")])
+
+    nav = _nav_row("edit_", "sub", page, total_pages)
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙 Back to Batches", callback_data="edit_back_batches")])
+
+    page_note = f"<i>Page {page + 1}/{total_pages} · </i>" if total_pages > 1 else ""
+    await query.edit_message_text(
+        f"✏️ <b>{_crumb('EDIT CLASS', view)}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{page_note}<i>{len(groups)} subject(s) · {len(view_jobs)} session(s)</i>\n\n"
+        "<i>Select a subject:</i> 👇",
+        reply_markup=InlineKeyboardMarkup(rows),
+        parse_mode=ParseMode.HTML
+    )
+    return EDIT_SELECT_SUBJECT
+
+
+async def _edit_render_sessions(query, context, class_jobs):
+    """Level 3: the individual sessions of one subject."""
+    view = context.user_data.get('edit_view', 'all')
+    groups = _subject_groups(_jobs_for_view(class_jobs, view))
+    idx = context.user_data.get('edit_sub_idx')
+
+    if idx is None or idx >= len(groups):
+        # The subject vanished (fired or deleted) — fall back a level rather
+        # than showing an index error.
+        return await _edit_render_subjects(query, context, class_jobs)
+
+    subject, batch, sessions = groups[idx]
+    context.user_data['edit_subject'] = subject
+    context.user_data['edit_batch'] = batch
+
+    page_items, page, total_pages = _paginate(sessions, context.user_data.get('edit_job_page', 0))
+    context.user_data['edit_job_page'] = page
+    offset = page * CLASS_NAV_PAGE_SIZE
+
+    rows = []
+    for i, job in enumerate(page_items):
+        day_str, time_str = _session_bits(job)
+        rows.append([InlineKeyboardButton(
+            f"🗓 {day_str} · ⏰ {time_str}", callback_data=f"edit_j_{offset + i}"
+        )])
+
+    nav = _nav_row("edit_", "job", page, total_pages)
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙 Back to Subjects", callback_data="edit_back_subjects")])
+
+    page_note = f"<i>Page {page + 1}/{total_pages}</i>\n" if total_pages > 1 else ""
+    await query.edit_message_text(
+        f"✏️ <b>{_crumb('EDIT CLASS', view, subject)}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📖 <b>{html.escape(safe_text(subject, 'Class'))}</b>\n"
+        f"🎯 {_batch_chip(batch)} <b>{html.escape(safe_text(batch, '—'))}</b> · "
+        f"{len(sessions)} session(s)\n{page_note}\n"
+        "<i>Select a session to modify:</i> 👇",
         reply_markup=InlineKeyboardMarkup(rows),
         parse_mode=ParseMode.HTML
     )
     return EDIT_SELECT_JOB
 
-async def edit_select_job(update, context):
-    query = update.callback_query
-    await query.answer()
-    
-    # Handle pagination
-    if query.data in ["edit_page_prev", "edit_page_next"]:
-        current_page = context.user_data.get('edit_page', 0)
-        if query.data == "edit_page_prev":
-            context.user_data['edit_page'] = max(0, current_page - 1)
-        else:
-            context.user_data['edit_page'] = current_page + 1
-        
-        # Rebuild the class list for new page
-        jobs = context.job_queue.jobs()
-        class_jobs = []
-        for j in jobs:
-            d = safe_job_data(j)
-            if j.name and d and 'batch' in d and len(f"edit_{j.name}") <= 64:
-                class_jobs.append(j)
-        
-        # Sort by Subject Name first, then by day/time
-        class_jobs.sort(key=lambda j: (
-            safe_job_data(j).get('subject', '').lower(),
-            safe_job_data(j).get('batch', '').lower(),
-            j.next_t if j.next_t else datetime.min.replace(tzinfo=IST)
-        ))
-        
-        PAGE_SIZE = 8
-        page = context.user_data['edit_page']
-        total_pages = max(1, (len(class_jobs) + PAGE_SIZE - 1) // PAGE_SIZE)
-        page = max(0, min(page, total_pages - 1))
-        context.user_data['edit_page'] = page
-        
-        start_idx = page * PAGE_SIZE
-        end_idx = min(start_idx + PAGE_SIZE, len(class_jobs))
-        page_jobs = class_jobs[start_idx:end_idx]
-        
-        rows = []
-        for job in page_jobs:
-            d = safe_job_data(job)
-            sub_name = d.get('subject', 'Class')
-            batch_label = d.get('batch', '?')
-            code, name = _split_subject(sub_name)
-            short_sub = code if code else (name[:14] + "…" if len(name) > 14 else name)
-            try:
-                day_str = job.next_t.strftime("%a, %d %b")
-                time_raw = d.get('time_display') or job.next_t.strftime("%H:%M")
-                time_str = _format_time_12h(time_raw)
-            except Exception:
-                day_str = ""
-                time_str = _format_time_12h(d.get('time_display', ''))
-            
-            btn_label = f"📖 [{batch_label}] {short_sub} • {day_str} ({time_str})"
-            if len(btn_label) > 46:
-                btn_label = f"📖 [{batch_label}] {short_sub[:10]} • {day_str[:6]} ({time_str})"
-            rows.append([InlineKeyboardButton(btn_label, callback_data=f"edit_{job.name}")])
-        
-        nav_row = []
-        if page > 0:
-            nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data="edit_page_prev"))
-        if page < total_pages - 1:
-            nav_row.append(InlineKeyboardButton("➡️ Next", callback_data="edit_page_next"))
-        if nav_row:
-            rows.append(nav_row)
-        
-        await query.edit_message_text(
-            f"✏️ <b>EDIT CLASS</b> ({len(class_jobs)} total)\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<i>Page {page + 1}/{total_pages} · Sorted by Subject &amp; Days</i>\n\n"
-            "<i>Select a class to modify:</i> 👇",
-            reply_markup=InlineKeyboardMarkup(rows),
-            parse_mode=ParseMode.HTML
-        )
-        return EDIT_SELECT_JOB
-    
-    # Handle class selection
-    context.user_data['edit_job_name'] = query.data.replace("edit_", "")
-    context.user_data['edit_page'] = 0  # Reset page for next time
-    jobs = context.job_queue.get_jobs_by_name(context.user_data['edit_job_name'])
-    if not jobs: return ConversationHandler.END
-    job_data = safe_job_data(jobs[0])
+
+async def _edit_render_fields(query, context, job):
+    """Level 4: what to change on the chosen session."""
+    job_data = safe_job_data(job)
+    context.user_data['edit_job_name'] = job.name
     context.user_data['old_job_data'] = job_data
-    context.user_data['old_next_t'] = jobs[0].next_t
-    
+    context.user_data['old_next_t'] = job.next_t
+
     kb = [
-        [InlineKeyboardButton("⏰ Change Start Time", callback_data="field_time"),
-         InlineKeyboardButton("⏰ Change End Time", callback_data="field_endtime")],
-        [InlineKeyboardButton("📅 Change Date", callback_data="field_date"),
-         InlineKeyboardButton("🔗 Change Link", callback_data="field_link")],
-        [InlineKeyboardButton("📝 Edit Message", callback_data="field_msg")],
-        [InlineKeyboardButton("💬 Edit Topic", callback_data="field_topic")],
-        [InlineKeyboardButton("🔙 Cancel", callback_data="field_cancel")],
+        [InlineKeyboardButton("⏰ Start Time", callback_data="field_time"),
+         InlineKeyboardButton("⏰ End Time", callback_data="field_endtime")],
+        [InlineKeyboardButton("📅 Date", callback_data="field_date"),
+         InlineKeyboardButton("🔗 Link", callback_data="field_link")],
+        [InlineKeyboardButton("📝 Message", callback_data="field_msg"),
+         InlineKeyboardButton("💬 Topic", callback_data="field_topic")],
+        [InlineKeyboardButton("🔙 Back to Sessions", callback_data="field_back")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="field_cancel")],
     ]
 
-    mode = ("Custom text" if job_data.get('manual_msg')
-            else "Auto-generated")
+    day_str, time_str = _session_bits(job)
+    mode = "Custom text" if job_data.get('manual_msg') else "Auto-generated"
+    # _topic_label, not a raw DB["topics"] lookup: the /classtopic default may
+    # not be present in the topics table, and it carries its own cached name.
+    topic_name = _topic_label(job_data.get('message_thread_id'))
+
     await query.edit_message_text(
         f"🔧 <b>WHAT TO EDIT?</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📖 <b>{html.escape(safe_text(job_data.get('subject'), 'Class'))}</b>\n"
-        f"🕒 {html.escape(_format_time_12h(job_data.get('time_display', '')))}\n"
+        f"🎯 {_batch_chip(job_data.get('batch'))} "
+        f"{html.escape(safe_text(job_data.get('batch'), '—'))}\n"
+        f"🗓 {html.escape(day_str)} · ⏰ "
+        f"{html.escape(_format_time_12h(job_data.get('time_display', '')))}\n"
+        f"💬 Topic: <i>{html.escape(safe_text(topic_name, 'General'))}</i>\n"
         f"✍️ Message: <i>{mode}</i>\n\n"
         f"<i>Select what you want to change:</i> 👇",
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode=ParseMode.HTML
     )
     return EDIT_CHOOSE_FIELD
+
+async def edit_nav(update, context):
+    """
+    Single router for every level of the edit browser.
+
+    One function handles all three levels because back-navigation crosses
+    conversation states in both directions; splitting it per state meant each
+    handler had to know how to render its neighbours anyway.
+    """
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "edit_cancel":
+        await query.edit_message_text("❌ Edit cancelled.")
+        return ConversationHandler.END
+
+    class_jobs = _collect_class_jobs(context)
+    if not class_jobs:
+        await query.edit_message_text(
+            "📭 <b>NO CLASSES LEFT</b>\n\n"
+            "<i>Every scheduled session has fired or been deleted.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return ConversationHandler.END
+
+    # Level 1 — batches
+    if data == "edit_back_batches":
+        context.user_data['edit_sub_page'] = 0
+        return await _edit_render_batches(query, context, class_jobs)
+
+    if data.startswith("edit_b_"):
+        context.user_data['edit_view'] = data[len("edit_b_"):]
+        context.user_data['edit_sub_page'] = 0
+        return await _edit_render_subjects(query, context, class_jobs)
+
+    # Level 2 — subjects
+    if data.startswith("edit_pgsub_"):
+        try:
+            context.user_data['edit_sub_page'] = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            context.user_data['edit_sub_page'] = 0
+        return await _edit_render_subjects(query, context, class_jobs)
+
+    if data == "edit_back_subjects":
+        return await _edit_render_subjects(query, context, class_jobs)
+
+    if data.startswith("edit_s_"):
+        try:
+            context.user_data['edit_sub_idx'] = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            return await _edit_render_subjects(query, context, class_jobs)
+        context.user_data['edit_job_page'] = 0
+        return await _edit_render_sessions(query, context, class_jobs)
+
+    # Level 3 — sessions
+    if data.startswith("edit_pgjob_"):
+        try:
+            context.user_data['edit_job_page'] = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            context.user_data['edit_job_page'] = 0
+        return await _edit_render_sessions(query, context, class_jobs)
+
+    if data.startswith("edit_j_"):
+        view = context.user_data.get('edit_view', 'all')
+        groups = _subject_groups(_jobs_for_view(class_jobs, view))
+        idx = context.user_data.get('edit_sub_idx')
+        try:
+            session_idx = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            return await _edit_render_sessions(query, context, class_jobs)
+
+        if idx is None or idx >= len(groups):
+            return await _edit_render_subjects(query, context, class_jobs)
+
+        sessions = groups[idx][2]
+        if session_idx >= len(sessions):
+            # List shifted under the admin (a class fired mid-navigation).
+            return await _edit_render_sessions(query, context, class_jobs)
+
+        return await _edit_render_fields(query, context, sessions[session_idx])
+
+    # Unrecognised / stale callback from an older message.
+    return await _edit_render_batches(query, context, class_jobs)
 
 # Sentinel meaning "revert this class to auto-generated text". Stored as the
 # pending edit value so the AI path can share the scope-selection step.
@@ -3011,6 +3345,15 @@ async def edit_choose_field(update, context):
         await query.edit_message_text("❌ Edit cancelled.")
         return ConversationHandler.END
 
+    # Step back up into the session list rather than dead-ending the wizard.
+    if field == "back":
+        class_jobs = _collect_class_jobs(context)
+        if not class_jobs:
+            await query.edit_message_text(
+                "📭 <b>NO CLASSES LEFT</b>", parse_mode=ParseMode.HTML)
+            return ConversationHandler.END
+        return await _edit_render_sessions(query, context, class_jobs)
+
     context.user_data['edit_field'] = field
 
     # Message editing first asks HOW, mirroring the scheduling wizard.
@@ -3038,7 +3381,9 @@ async def edit_choose_field(update, context):
         "endtime": "⏰ <b>NEW END TIME</b>\n\n<i>Enter HH:MM (24-hour), e.g. <code>15:30</code>\nOr type <code>None</code> to remove end time.</i>",
         "date": "📅 <b>NEW DATE</b>\n\n<i>Enter YYYY-MM-DD, e.g. <code>2026-08-20</code></i>",
         "link": "🔗 <b>NEW LINK</b>\n\n<i>Paste the new meeting link (or type <code>None</code>)</i>",
-        "topic": "💬 <b>NEW TOPIC ID</b>\n\n<i>Enter Topic ID (0 for General)</i>",
+        "topic": ("💬 <b>NEW TOPIC ID</b>\n\n"
+                  "<i>Enter a Topic ID, or</i> <code>0</code> <i>for General.</i>\n"
+                  "<i>See</i> /topics <i>for the list.</i>"),
     }
     await query.edit_message_text(
         prompts.get(field, "❓ Enter new value:"),
@@ -3278,8 +3623,9 @@ async def edit_scope_handler(update, context):
                     data['msg_type'] = "MANUAL"
                     data['manual_msg'] = new_val
             elif field == "topic":
-                tid = int(new_val) if new_val != "0" else None
-                data['message_thread_id'] = tid
+                # '0' is an explicit "General" choice, which must survive the
+                # /classtopic default rather than being treated as "inherit".
+                data['message_thread_id'] = GENERAL_TOPIC if new_val == "0" else int(new_val)
 
             # Don't reschedule into the past — it would fire instantly.
             if next_t <= datetime.now(IST):
@@ -4156,6 +4502,10 @@ async def send_alert_job(context: ContextTypes.DEFAULT_TYPE):
         sent = False
         
         # FALLBACK LEVEL 1: Try with topic + HTML
+        # _resolve_thread_id applies the /classtopic default when this class has
+        # no override of its own. Fallback levels 2 and 3 below still drop to
+        # General if the resolved topic is gone, so a stale default can't
+        # swallow an alert.
         try:
             await context.bot.send_message(
                 job.chat_id, 
@@ -4163,7 +4513,7 @@ async def send_alert_job(context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML, 
                 reply_markup=kb, 
                 disable_web_page_preview=True,
-                message_thread_id=data.get('message_thread_id')
+                message_thread_id=_resolve_thread_id(data)
             )
             sent = True
         except Exception as e1:
@@ -4463,8 +4813,12 @@ async def cmsg_link_input(update, context):
         
         # Check for topics
         topics = DB.get("topics", {})
+        default_tid, default_name = get_class_topic()
         if topics:
             kb = []
+            if default_tid:
+                kb.append([InlineKeyboardButton(
+                    f"⭐ Use Default ({default_name})", callback_data="ctopic_default")])
             row = []
             for tid, name in topics.items():
                 row.append(InlineKeyboardButton(name, callback_data=f"ctopic_{tid}"))
@@ -4498,12 +4852,17 @@ async def cmsg_topic_selection(update, context):
         await query.answer()
         data = query.data
         
-        if data == "ctopic_general":
+        if data == "ctopic_default":
             context.user_data['cmsg_topic_id'] = None
+        elif data == "ctopic_general":
+            context.user_data['cmsg_topic_id'] = GENERAL_TOPIC
         else:
             tid = data.replace("ctopic_", "")
-            context.user_data['cmsg_topic_id'] = int(tid)
-            
+            try:
+                context.user_data['cmsg_topic_id'] = int(tid)
+            except ValueError:
+                context.user_data['cmsg_topic_id'] = None
+
         return await cmsg_finalize(update, context)
     except Exception as e:
         logger.error(f"Error in cmsg_topic_selection: {e}")
@@ -4577,7 +4936,7 @@ async def cmsg_finalize(update, context):
         msg_obj = update.callback_query if update.callback_query else update
         reply_func = msg_obj.message.reply_text if hasattr(msg_obj, 'message') else msg_obj.reply_text
         
-        topic_name = DB.get("topics", {}).get(str(topic_id), "General") if topic_id else "General"
+        topic_name = _topic_label(topic_id)
         
         await reply_func(
             f"✅ <b>CUSTOM MESSAGE SCHEDULED</b>\n"
@@ -4605,7 +4964,7 @@ async def send_custom_msg_job(context: ContextTypes.DEFAULT_TYPE):
         data = job.data
         msg = data.get('manual_msg', '')
         link = data.get('link')
-        topic_id = data.get('message_thread_id')
+        topic_id = _resolve_thread_id(data)
         
         if link and link != "None":
             msg += f"\n\n🔗 <a href='{link}'>Click Here</a>"
@@ -4664,6 +5023,139 @@ async def register_topic_command(update, context):
         )
     except Exception as e:
         logger.error(f"Error in register_topic: {e}")
+
+async def classtopic_command(update, context):
+    """
+    /classtopic — choose the forum topic every scheduled class alert posts into.
+
+    Three forms:
+      • run inside a topic, in the linked group -> that topic becomes the default
+      • run in a DM                             -> read-only status
+      • /classtopic off                         -> back to General
+
+    Deliberately additive: classes that carry their own topic override still win,
+    and clearing this setting restores exactly the old behaviour.
+    """
+    try:
+        user = update.effective_user
+        if not is_admin(user.username if user else None):
+            await deny_access(update, context)
+            return
+
+        remember_owner_id(user, update)
+
+        message = update.effective_message
+        chat = update.effective_chat
+        arg = (context.args[0].strip().lower() if context.args else "")
+        cur_id, cur_name = get_class_topic()
+
+        # ── Clear ──────────────────────────────────────────────────────────
+        if arg in ("off", "none", "general", "clear", "reset"):
+            DB["config"]["class_topic_id"] = None
+            DB["config"]["class_topic_name"] = None
+            save_db()
+            audit("class_topic_cleared", user, f"was={cur_id or 'unset'}")
+            await message.reply_text(
+                "✅ <b>CLASS TOPIC CLEARED</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "<i>Class alerts will now post to</i> <b>General</b>.\n\n"
+                "<i>Classes with their own topic override are unaffected.</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        # ── Status (DM) ────────────────────────────────────────────────────
+        if is_private_chat(update):
+            grp_name = DB.get("config", {}).get("group_name", "❌ No Group Linked")
+            if cur_id:
+                body = (
+                    f"🏷️ Current: <b>{html.escape(str(cur_name))}</b> "
+                    f"(ID <code>{cur_id}</code>)\n"
+                    f"📍 Group: <b>{html.escape(safe_text(grp_name, '—'))}</b>\n\n"
+                )
+            else:
+                body = (
+                    "🏷️ Current: <b>General</b> <i>(no topic set)</i>\n"
+                    f"📍 Group: <b>{html.escape(safe_text(grp_name, '—'))}</b>\n\n"
+                )
+            await message.reply_text(
+                "#️⃣ <b>CLASS TOPIC</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"{body}"
+                "<i>To change it, run</i> <code>/classtopic</code> <i>inside the "
+                "topic you want, in the group.</i>\n"
+                "<i>Use</i> <code>/classtopic off</code> <i>to send to General.</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        # ── Set (in group) ─────────────────────────────────────────────────
+        linked_id = DB.get("config", {}).get("group_id")
+        if linked_id and chat.id != linked_id:
+            await message.reply_text(
+                "⛔ <b>WRONG GROUP</b>\n\n"
+                "<i>This isn't the group I'm scheduling classes for, so a topic "
+                "here would never receive alerts.</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        if not getattr(chat, "is_forum", False):
+            await message.reply_text(
+                "⛔ <b>TOPICS NOT ENABLED</b>\n\n"
+                "<i>This command only works in a supergroup with Topics turned "
+                "on.</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        thread_id = message.message_thread_id
+        if not thread_id:
+            await message.reply_text(
+                "⛔ <b>RUN THIS INSIDE A TOPIC</b>\n\n"
+                "<i>Open the topic you want class alerts in, then send</i> "
+                "<code>/classtopic</code> <i>there.</i>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        # Prefer a name we already know; fall back to the creation event.
+        topic_name = DB.get("topics", {}).get(str(thread_id))
+        if not topic_name:
+            created = getattr(message, "reply_to_message", None)
+            created = getattr(created, "forum_topic_created", None) if created else None
+            topic_name = getattr(created, "name", None) or f"Topic {thread_id}"
+
+        DB["config"]["class_topic_id"] = int(thread_id)
+        DB["config"]["class_topic_name"] = topic_name
+        # Keep it visible in /topics too, so the two lists never disagree.
+        if not isinstance(DB.get("topics"), dict):
+            DB["topics"] = {}
+        DB["topics"][str(thread_id)] = topic_name
+        save_db()
+
+        audit("class_topic_set", user, f"topic={thread_id} name={topic_name}")
+
+        await message.reply_text(
+            "✅ <b>CLASS TOPIC SET</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🏷️ Topic: <b>{html.escape(safe_text(topic_name, '—'))}</b>\n"
+            f"📌 ID: <code>{thread_id}</code>\n\n"
+            "<i>All scheduled class alerts will now post here by default.</i>\n"
+            "<i>Use</i> <code>/classtopic off</code> <i>to send to General.</i>",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logger.error(f"Error in classtopic_command: {e}")
+        try:
+            await update.effective_message.reply_text(
+                "❌ <b>COULD NOT SET CLASS TOPIC</b>\n\n"
+                f"<code>{html.escape(str(e)[:150])}</code>",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+
 
 async def auto_register_topic(update, context):
     """Auto-register new topics created in the group"""
@@ -4733,9 +5225,11 @@ async def view_topics(update, context):
         await update.message.reply_text("📭 <b>NO TOPICS FOUND.</b>")
         return
 
+    class_tid = get_class_topic()[0]
     msg = "💬 <b>REGISTERED TOPICS</b>\n━━━━━━━━━━━━━━━━━━\n\n"
     for tid, name in topics.items():
-        msg += f"🏷️ <b>{name}</b> (ID: {tid})\n"
+        star = " ⭐ <i>class alerts</i>" if class_tid and str(tid) == str(class_tid) else ""
+        msg += f"🏷️ <b>{name}</b> (ID: {tid}){star}\n"
     
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
@@ -4802,8 +5296,10 @@ async def remove_topic_save(update, context):
     if tid in topics:
         name = topics[tid]
         del DB["topics"][tid]
+        note = _clear_class_topic_if(tid)
         save_db()
-        await update.message.reply_text(f"✅ <b>REMOVED:</b> {name}", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            f"✅ <b>REMOVED:</b> {name}{note}", parse_mode=ParseMode.HTML)
     else:
         await update.message.reply_text("❌ <b>ID NOT FOUND!</b>", parse_mode=ParseMode.HTML)
     return ConversationHandler.END
@@ -4867,6 +5363,10 @@ async def edit_topic_save(update, context):
         DB["topics"] = {}
     
     DB["topics"][tid] = new_name
+    # Keep the cached class-topic name from going stale after a rename.
+    current = DB.get("config", {}).get("class_topic_id")
+    if current is not None and str(current) == str(tid):
+        DB["config"]["class_topic_name"] = new_name
     save_db()
     
     await update.message.reply_text(
@@ -4915,10 +5415,11 @@ async def delete_topic_confirm(update, context):
     if tid in topics:
         name = topics[tid]
         del DB["topics"][tid]
+        note = _clear_class_topic_if(tid)
         save_db()
         await query.edit_message_text(
             f"✅ <b>DELETED:</b> {name}\n\n"
-            f"<i>Topic ID {tid} removed.</i>",
+            f"<i>Topic ID {tid} removed.</i>{note}",
             parse_mode=ParseMode.HTML
         )
     else:
@@ -4941,13 +5442,19 @@ async def topics_command(update, context):
         )
         return
     
+    class_tid, class_name = get_class_topic()
     msg = "💬 <b>REGISTERED TOPICS</b>\n━━━━━━━━━━━━━━━━━━\n\n"
     for tid, name in topics.items():
-        msg += f"🏷️ <b>{name}</b>\n    ID: <code>{tid}</code>\n\n"
-    
+        star = "  ⭐" if class_tid and str(tid) == str(class_tid) else ""
+        msg += f"🏷️ <b>{name}</b>{star}\n    ID: <code>{tid}</code>\n\n"
+
+    dest = (f"⭐ <b>{html.escape(str(class_name))}</b>" if class_tid
+            else "<b>General</b> <i>(no topic set)</i>")
     msg += (
         "━━━━━━━━━━━━━━━━━━\n"
+        f"#️⃣ <b>Class alerts go to:</b> {dest}\n\n"
         "📝 <b>Commands:</b>\n"
+        "• /classtopic - Set topic for class alerts\n"
         "• /edittopic - Rename a topic\n"
         "• /deletetopic - Remove a topic"
     )
@@ -5091,7 +5598,15 @@ async def send_night_summary(context: ContextTypes.DEFAULT_TYPE):
                 msg += f"     ⏰ {c['time']}\n\n"
             msg += "<i>Get ready for tomorrow! 💪</i>"
         
-        await context.bot.send_message(gid, text=msg, parse_mode=ParseMode.HTML)
+        # Same destination as the class alerts it summarises.
+        try:
+            await context.bot.send_message(
+                gid, text=msg, parse_mode=ParseMode.HTML,
+                message_thread_id=get_class_topic()[0]
+            )
+        except Exception as topic_err:
+            logger.warning(f"Night summary topic send failed, using General: {topic_err}")
+            await context.bot.send_message(gid, text=msg, parse_mode=ParseMode.HTML)
         logger.info("🌙 Night summary sent")
         
     except Exception as e:
@@ -5522,105 +6037,193 @@ async def mark_attendance(update, context):
             pass
 
 async def view_schedule_handler(update, context):
-    """View schedule grouped by Subject with days & timings"""
-    query = None
-    if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        
+    """Level 1 of the schedule browser: pick a batch."""
     if not await require_private_admin(update, context): return
-    
-    # Determine page number
-    page = 0
-    if query and query.data.startswith("schedule_page_"):
-        try:
-            page = int(query.data.split("_")[-1])
-        except Exception:
-            page = 0
-    
-    jobs = context.job_queue.jobs()
-    
-    # Filter only class jobs
-    class_jobs = [j for j in jobs if j.name and isinstance(j.data, dict) and 'batch' in j.data]
-    
+
+    class_jobs = _collect_class_jobs(context)
     if not class_jobs:
         msg = (
             "📭 <b>NO UPCOMING CLASSES!</b>\n\n"
             "<i>Schedule some classes first.</i>"
         )
-        if query:
-            await query.edit_message_text(msg, parse_mode=ParseMode.HTML)
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(msg, parse_mode=ParseMode.HTML)
         else:
             await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
         return
-    
-    # Group jobs by (batch, subject)
-    from collections import defaultdict
-    grouped = defaultdict(list)
-    for j in class_jobs:
-        d = safe_job_data(j)
-        key = (d.get('batch', 'Unknown'), d.get('subject', 'Class'))
-        grouped[key].append(j)
-    
-    # Sort sessions within each subject chronologically
-    for key in grouped:
-        grouped[key].sort(key=lambda j: j.next_t if j.next_t else datetime.min.replace(tzinfo=IST))
-        
-    # Sort the subject groups alphabetically by subject name, then batch
-    sorted_groups = sorted(grouped.items(), key=lambda item: (item[0][1].lower(), item[0][0].lower()))
-    
-    # Paginate by Subject Groups (3 subjects per page)
-    PAGE_SIZE = 3
-    total_pages = max(1, (len(sorted_groups) + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = max(0, min(page, total_pages - 1))
-    
-    start_idx = page * PAGE_SIZE
-    end_idx = min(start_idx + PAGE_SIZE, len(sorted_groups))
-    page_groups = sorted_groups[start_idx:end_idx]
-    
-    msg = (
-        f"📅 <b>UPCOMING CLASS SCHEDULE</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Page {page + 1}/{total_pages} · {len(class_jobs)} total session(s)</i>\n\n"
+
+    context.user_data.pop('sch_view', None)
+    context.user_data.pop('sch_sub_idx', None)
+
+    rows = _batch_picker_rows(class_jobs, "sch_")
+    text = (
+        f"📅 <b>CLASS SCHEDULE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>{len(class_jobs)} upcoming session(s)</i>\n\n"
+        "<i>Select a batch to view:</i> 👇"
     )
-    
-    for (batch, subject), session_jobs in page_groups:
-        batch_chip = ("🟦" if batch == "CSDA" else "🟧" if batch == "AICS" else "🟪")
-        msg += f"📚 <b>{html.escape(subject)}</b>\n"
-        msg += f"🎯 <i>Batch:</i> {batch_chip} <b>{html.escape(batch)}</b> ({len(session_jobs)} session{'s' if len(session_jobs) > 1 else ''})\n"
-        
-        for job in session_jobs:
-            d = safe_job_data(job)
-            try:
-                day_name = job.next_t.strftime("%A")
-                date_str = job.next_t.strftime("%d %b")
-                time_raw = d.get('time_display') or job.next_t.strftime("%H:%M")
-                time_str = _format_time_12h(time_raw)
-            except Exception:
-                day_name = "Scheduled"
-                date_str = ""
-                time_str = _format_time_12h(d.get('time_display', ''))
-                
-            msg += f"  • 🗓 <b>{day_name}</b>, {date_str} — ⏰ <code>{html.escape(time_str)}</code>\n"
-        
-        msg += "\n"
-        
-    # Navigation Buttons
-    buttons = []
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"schedule_page_{page-1}"))
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"schedule_page_{page+1}"))
-    
-    if nav_row:
-        buttons.append(nav_row)
-        
-    # Send or Edit Message
-    if query:
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None, parse_mode=ParseMode.HTML)
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None, parse_mode=ParseMode.HTML)
+        await update.message.reply_text(
+            text, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+
+
+async def _sch_render_batches(query, context, class_jobs):
+    rows = _batch_picker_rows(class_jobs, "sch_")
+    await query.edit_message_text(
+        f"📅 <b>CLASS SCHEDULE</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>{len(class_jobs)} upcoming session(s)</i>\n\n"
+        "<i>Select a batch to view:</i> 👇",
+        reply_markup=InlineKeyboardMarkup(rows),
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def _sch_render_subjects(query, context, class_jobs):
+    """Level 2: subjects inside the chosen batch view."""
+    view = context.user_data.get('sch_view', 'all')
+    view_jobs = _jobs_for_view(class_jobs, view)
+    groups = _subject_groups(view_jobs)
+
+    if not groups:
+        return await _sch_render_batches(query, context, class_jobs)
+
+    page_items, page, total_pages = _paginate(groups, context.user_data.get('sch_sub_page', 0))
+    context.user_data['sch_sub_page'] = page
+    offset = page * CLASS_NAV_PAGE_SIZE
+
+    rows = []
+    for i, (subject, batch, sessions) in enumerate(page_items):
+        chip = _batch_chip(batch) if view == "all" else "📖"
+        rows.append([InlineKeyboardButton(
+            f"{chip} {_short_subject(subject, 22)} ({len(sessions)})",
+            callback_data=f"sch_s_{offset + i}"
+        )])
+
+    nav = _nav_row("sch_", "sub", page, total_pages)
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙 Back to Batches", callback_data="sch_back_batches")])
+
+    page_note = f"<i>Page {page + 1}/{total_pages} · </i>" if total_pages > 1 else ""
+    await query.edit_message_text(
+        f"📅 <b>{_crumb('SCHEDULE', view)}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{page_note}<i>{len(groups)} subject(s) · {len(view_jobs)} session(s)</i>\n\n"
+        "<i>Select a subject:</i> 👇",
+        reply_markup=InlineKeyboardMarkup(rows),
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def _sch_render_sessions(query, context, class_jobs):
+    """Level 3: read-only detail for every session of one subject."""
+    view = context.user_data.get('sch_view', 'all')
+    groups = _subject_groups(_jobs_for_view(class_jobs, view))
+    idx = context.user_data.get('sch_sub_idx')
+
+    if idx is None or idx >= len(groups):
+        return await _sch_render_subjects(query, context, class_jobs)
+
+    subject, batch, sessions = groups[idx]
+
+    msg = (
+        f"📅 <b>{_crumb('SCHEDULE', view, subject)}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📚 <b>{html.escape(safe_text(subject, 'Class'))}</b>\n"
+        f"🎯 {_batch_chip(batch)} <b>{html.escape(safe_text(batch, '—'))}</b> · "
+        f"{len(sessions)} session(s)\n\n"
+    )
+
+    # This level renders as text, not buttons, so cap it against Telegram's
+    # 4096-character message limit rather than paginating.
+    SESSION_DETAIL_CAP = 20
+    for job in sessions[:SESSION_DETAIL_CAP]:
+        d = safe_job_data(job)
+        try:
+            day_name = job.next_t.strftime("%A")
+            date_str = job.next_t.strftime("%d %b")
+        except Exception:
+            day_name, date_str = "Scheduled", ""
+        time_str = _format_time_12h(d.get('time_display') or "")
+        if not time_str:
+            try:
+                time_str = _format_time_12h(job.next_t.strftime("%H:%M"))
+            except Exception:
+                time_str = "—"
+
+        msg += f"• 🗓 <b>{day_name}</b>, {date_str} — ⏰ <code>{html.escape(time_str)}</code>\n"
+
+        details = []
+        link = d.get('link')
+        if link and str(link) not in ("None", "Check Group"):
+            details.append("🔗 Link attached")
+        elif str(link) == "Check Group":
+            details.append("🔗 Check group")
+
+        details.append(f"💬 {html.escape(_topic_label(d.get('message_thread_id')))}")
+
+        details.append("✍️ Custom" if d.get('manual_msg') else "✨ Auto")
+        msg += f"   <i>{' · '.join(details)}</i>\n"
+
+    if len(sessions) > SESSION_DETAIL_CAP:
+        msg += f"\n<i>…and {len(sessions) - SESSION_DETAIL_CAP} more session(s)</i>\n"
+
+    rows = [[InlineKeyboardButton("🔙 Back to Subjects", callback_data="sch_back_subjects")]]
+    await query.edit_message_text(
+        msg, reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.HTML)
+
+
+async def schedule_nav(update, context):
+    """Router for every level of the schedule browser."""
+    if not await require_admin_callback(update, context): return
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    class_jobs = _collect_class_jobs(context)
+    if not class_jobs:
+        await query.edit_message_text(
+            "📭 <b>NO UPCOMING CLASSES!</b>\n\n"
+            "<i>Schedule some classes first.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    # Legacy flat-pagination buttons from an older build.
+    if data.startswith("schedule_page_") or data == "sch_back_batches":
+        context.user_data['sch_sub_page'] = 0
+        return await _sch_render_batches(query, context, class_jobs)
+
+    if data.startswith("sch_b_"):
+        context.user_data['sch_view'] = data[len("sch_b_"):]
+        context.user_data['sch_sub_page'] = 0
+        return await _sch_render_subjects(query, context, class_jobs)
+
+    if data.startswith("sch_pgsub_"):
+        try:
+            context.user_data['sch_sub_page'] = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            context.user_data['sch_sub_page'] = 0
+        return await _sch_render_subjects(query, context, class_jobs)
+
+    if data == "sch_back_subjects":
+        return await _sch_render_subjects(query, context, class_jobs)
+
+    if data.startswith("sch_s_"):
+        try:
+            context.user_data['sch_sub_idx'] = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            return await _sch_render_subjects(query, context, class_jobs)
+        return await _sch_render_sessions(query, context, class_jobs)
+
+    return await _sch_render_batches(query, context, class_jobs)
 
 async def prompt_image_upload(update, context):
     if not await require_private_admin(update, context): return
@@ -6009,182 +6612,305 @@ async def viewfeedback_handler(update, context):
     )
 
 async def delete_menu(update, context):
-    """Delete classes with pagination - sorted by Subject Name & Days"""
+    """Level 1 of the delete browser: pick a batch."""
     if not await require_private_admin(update, context): return
-    jobs = context.job_queue.jobs()
-    valid_jobs = [j for j in jobs if j.name and isinstance(j.data, dict) and 'batch' in j.data and len(f"kill_{j.name}") <= 64]
-    
-    if not valid_jobs:
+
+    class_jobs = _collect_class_jobs(context)
+    if not class_jobs:
         await update.message.reply_text(
             "📭 <b>NO CLASSES TO DELETE!</b>\n\n"
             "<i>Schedule some classes first.</i>",
             parse_mode=ParseMode.HTML
         )
         return
-    
-    # Sort by Subject Name first, then by Day/Time
-    valid_jobs.sort(key=lambda j: (
-        safe_job_data(j).get('subject', '').lower(),
-        safe_job_data(j).get('batch', '').lower(),
-        j.next_t if j.next_t else datetime.min.replace(tzinfo=IST)
-    ))
-    
-    # Store jobs in context for pagination
-    context.user_data['delete_jobs'] = [j.name for j in valid_jobs]
-    context.user_data['delete_page'] = 0
-    
-    await show_delete_page(update.message, context, valid_jobs)
 
-async def show_delete_page(message_or_query, context, valid_jobs=None, edit=False):
-    """Show delete page with pagination"""
-    if valid_jobs is None:
-        jobs = context.job_queue.jobs()
-        job_names = context.user_data.get('delete_jobs', [])
-        valid_jobs = [j for j in jobs if j.name in job_names]
-        valid_jobs.sort(key=lambda j: (
-            safe_job_data(j).get('subject', '').lower(),
-            safe_job_data(j).get('batch', '').lower(),
-            j.next_t if j.next_t else datetime.min.replace(tzinfo=IST)
-        ))
-    
-    PAGE_SIZE = 8
-    page = context.user_data.get('delete_page', 0)
-    total_pages = max(1, (len(valid_jobs) + PAGE_SIZE - 1) // PAGE_SIZE)
-    
-    # Ensure page is in bounds
-    page = max(0, min(page, total_pages - 1))
-    context.user_data['delete_page'] = page
-    
-    start_idx = page * PAGE_SIZE
-    end_idx = min(start_idx + PAGE_SIZE, len(valid_jobs))
-    page_jobs = valid_jobs[start_idx:end_idx]
-    
-    rows = []
-    for j in page_jobs:
-        d = safe_job_data(j)
-        sub_name = d.get('subject', 'Class')
-        batch_label = d.get('batch', '?')
-        code, name = _split_subject(sub_name)
-        short_sub = code if code else (name[:14] + "…" if len(name) > 14 else name)
-        try:
-            day_str = j.next_t.strftime("%a, %d %b")
-            time_raw = d.get('time_display') or j.next_t.strftime("%H:%M")
-            time_str = _format_time_12h(time_raw)
-        except Exception:
-            day_str = ""
-            time_str = _format_time_12h(d.get('time_display', ''))
-        
-        btn_label = f"❌ [{batch_label}] {short_sub} • {day_str} ({time_str})"
-        if len(btn_label) > 46:
-            btn_label = f"❌ [{batch_label}] {short_sub[:10]} • {day_str[:6]} ({time_str})"
-        rows.append([InlineKeyboardButton(btn_label, callback_data=f"kill_{j.name}")])
-    
-    # Navigation and batch delete
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data="del_page_prev"))
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton("➡️ Next", callback_data="del_page_next"))
-    if nav_row:
-        rows.append(nav_row)
-    
-    # Add Delete All button
-    if len(valid_jobs) > 1:
-        rows.append([InlineKeyboardButton(f"🗑️ DELETE ALL ({len(valid_jobs)})", callback_data="kill_all_confirm")])
-    
-    text = (
-        f"🗑️ <b>DELETE CLASSES</b> ({len(valid_jobs)} total)\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Page {page + 1}/{total_pages} · Sorted by Subject &amp; Days</i>\n\n"
-        "<i>Tap to delete:</i> 👇"
+    context.user_data.pop('del_view', None)
+    context.user_data.pop('del_sub_idx', None)
+
+    rows = _batch_picker_rows(class_jobs, "del_")
+    rows.append([InlineKeyboardButton("🔙 Cancel", callback_data="del_cancel")])
+
+    await update.message.reply_text(
+        f"🗑️ <b>DELETE CLASS</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>{len(class_jobs)} scheduled session(s)</i>\n\n"
+        "<i>Select a batch:</i> 👇",
+        reply_markup=InlineKeyboardMarkup(rows),
+        parse_mode=ParseMode.HTML
     )
-    
-    if edit:
-        await message_or_query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(rows),
-            parse_mode=ParseMode.HTML
-        )
-    else:
-        await message_or_query.reply_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(rows),
-            parse_mode=ParseMode.HTML
-        )
 
-async def handle_kill(update, context):
-    """Handle delete class callbacks - single deletion, pagination, and delete all"""
-    # This handler is global, so the tap can come from anyone who can see ANY
-    # message of ours with a keyboard — including the attendance button in the
-    # group, which spells out the job name this callback deletes.
+
+async def _del_render_batches(query, context, class_jobs):
+    rows = _batch_picker_rows(class_jobs, "del_")
+    rows.append([InlineKeyboardButton("🔙 Cancel", callback_data="del_cancel")])
+    await query.edit_message_text(
+        f"🗑️ <b>DELETE CLASS</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>{len(class_jobs)} scheduled session(s)</i>\n\n"
+        "<i>Select a batch:</i> 👇",
+        reply_markup=InlineKeyboardMarkup(rows),
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def _del_render_subjects(query, context, class_jobs):
+    """Level 2: subjects inside the chosen batch view."""
+    view = context.user_data.get('del_view', 'all')
+    view_jobs = _jobs_for_view(class_jobs, view)
+    groups = _subject_groups(view_jobs)
+
+    if not groups:
+        return await _del_render_batches(query, context, class_jobs)
+
+    page_items, page, total_pages = _paginate(groups, context.user_data.get('del_sub_page', 0))
+    context.user_data['del_sub_page'] = page
+    offset = page * CLASS_NAV_PAGE_SIZE
+
+    rows = []
+    for i, (subject, batch, sessions) in enumerate(page_items):
+        chip = _batch_chip(batch) if view == "all" else "📖"
+        rows.append([InlineKeyboardButton(
+            f"{chip} {_short_subject(subject, 22)} ({len(sessions)})",
+            callback_data=f"del_s_{offset + i}"
+        )])
+
+    nav = _nav_row("del_", "sub", page, total_pages)
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙 Back to Batches", callback_data="del_back_batches")])
+
+    page_note = f"<i>Page {page + 1}/{total_pages} · </i>" if total_pages > 1 else ""
+    await query.edit_message_text(
+        f"🗑️ <b>{_crumb('DELETE CLASS', view)}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{page_note}<i>{len(groups)} subject(s) · {len(view_jobs)} session(s)</i>\n\n"
+        "<i>Select a subject:</i> 👇",
+        reply_markup=InlineKeyboardMarkup(rows),
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def _del_render_sessions(query, context, class_jobs):
+    """Level 3: sessions of one subject, plus a subject-scoped bulk delete."""
+    view = context.user_data.get('del_view', 'all')
+    groups = _subject_groups(_jobs_for_view(class_jobs, view))
+    idx = context.user_data.get('del_sub_idx')
+
+    if idx is None or idx >= len(groups):
+        return await _del_render_subjects(query, context, class_jobs)
+
+    subject, batch, sessions = groups[idx]
+    context.user_data['del_subject'] = subject
+    context.user_data['del_batch'] = batch
+
+    page_items, page, total_pages = _paginate(sessions, context.user_data.get('del_job_page', 0))
+    context.user_data['del_job_page'] = page
+    offset = page * CLASS_NAV_PAGE_SIZE
+
+    rows = []
+    for i, job in enumerate(page_items):
+        day_str, time_str = _session_bits(job)
+        rows.append([InlineKeyboardButton(
+            f"❌ {day_str} · ⏰ {time_str}", callback_data=f"del_j_{offset + i}"
+        )])
+
+    nav = _nav_row("del_", "job", page, total_pages)
+    if nav:
+        rows.append(nav)
+
+    # Bulk delete is scoped to the subject you are already looking at, instead
+    # of the old global "DELETE ALL" that could wipe the whole timetable in one
+    # unconfirmed tap.
+    if len(sessions) > 1:
+        rows.append([InlineKeyboardButton(
+            f"🗑️ Delete ALL {_short_subject(subject, 14)} ({len(sessions)})",
+            callback_data="del_wipe"
+        )])
+    rows.append([InlineKeyboardButton("🔙 Back to Subjects", callback_data="del_back_subjects")])
+
+    page_note = f"<i>Page {page + 1}/{total_pages}</i>\n" if total_pages > 1 else ""
+    await query.edit_message_text(
+        f"🗑️ <b>{_crumb('DELETE CLASS', view, subject)}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📖 <b>{html.escape(safe_text(subject, 'Class'))}</b>\n"
+        f"🎯 {_batch_chip(batch)} <b>{html.escape(safe_text(batch, '—'))}</b> · "
+        f"{len(sessions)} session(s)\n{page_note}\n"
+        "<i>Tap a session to delete:</i> 👇",
+        reply_markup=InlineKeyboardMarkup(rows),
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def delete_nav(update, context):
+    """Router for every level of the delete browser."""
+    # Global handler, so the tap can come from anyone who can see any of our
+    # keyboards. Index-based callback data means a spoofed payload can only
+    # address a class the caller could already list.
     if not await require_admin_callback(update, context): return
     query = update.callback_query
     await query.answer()
     data = query.data
-    
-    # Handle pagination
-    if data == "del_page_prev":
-        context.user_data['delete_page'] = max(0, context.user_data.get('delete_page', 0) - 1)
-        await show_delete_page(query, context, edit=True)
+
+    if data == "del_cancel":
+        await query.edit_message_text("❌ Cancelled.")
         return
-    elif data == "del_page_next":
-        context.user_data['delete_page'] = context.user_data.get('delete_page', 0) + 1
-        await show_delete_page(query, context, edit=True)
+
+    class_jobs = _collect_class_jobs(context)
+    if not class_jobs:
+        await query.edit_message_text(
+            "📭 <b>NO CLASSES LEFT</b>\n\n"
+            "<i>Every scheduled session has fired or been deleted.</i>",
+            parse_mode=ParseMode.HTML
+        )
         return
-    
-    # Handle delete all confirmation
-    # Handle delete all confirmation
-    if data == "kill_all_confirm":
-        job_names = context.user_data.get('delete_jobs', [])
+
+    # Buttons from an older build addressed jobs by name; those messages are
+    # stale now, so send the admin back to the top rather than acting on them.
+    if data.startswith("kill_") or data in ("del_page_prev", "del_page_next"):
+        return await _del_render_batches(query, context, class_jobs)
+
+    if data == "del_back_batches":
+        context.user_data['del_sub_page'] = 0
+        return await _del_render_batches(query, context, class_jobs)
+
+    if data.startswith("del_b_"):
+        context.user_data['del_view'] = data[len("del_b_"):]
+        context.user_data['del_sub_page'] = 0
+        return await _del_render_subjects(query, context, class_jobs)
+
+    if data.startswith("del_pgsub_"):
+        try:
+            context.user_data['del_sub_page'] = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            context.user_data['del_sub_page'] = 0
+        return await _del_render_subjects(query, context, class_jobs)
+
+    if data == "del_back_subjects":
+        return await _del_render_subjects(query, context, class_jobs)
+
+    if data.startswith("del_s_"):
+        try:
+            context.user_data['del_sub_idx'] = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            return await _del_render_subjects(query, context, class_jobs)
+        context.user_data['del_job_page'] = 0
+        return await _del_render_sessions(query, context, class_jobs)
+
+    if data.startswith("del_pgjob_"):
+        try:
+            context.user_data['del_job_page'] = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            context.user_data['del_job_page'] = 0
+        return await _del_render_sessions(query, context, class_jobs)
+
+    # Bulk delete for the current subject — always confirmed first.
+    if data == "del_wipe":
+        view = context.user_data.get('del_view', 'all')
+        groups = _subject_groups(_jobs_for_view(class_jobs, view))
+        idx = context.user_data.get('del_sub_idx')
+        if idx is None or idx >= len(groups):
+            return await _del_render_subjects(query, context, class_jobs)
+        subject, batch, sessions = groups[idx]
+        kb = [
+            [InlineKeyboardButton(f"✅ Yes, delete {len(sessions)}", callback_data="del_wipe_yes")],
+            [InlineKeyboardButton("🔙 No, go back", callback_data="del_back_sessions")],
+        ]
+        await query.edit_message_text(
+            f"⚠️ <b>DELETE ALL SESSIONS?</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📖 <b>{html.escape(safe_text(subject, 'Class'))}</b>\n"
+            f"🎯 {_batch_chip(batch)} {html.escape(safe_text(batch, '—'))}\n"
+            f"🗑️ <b>{len(sessions)}</b> session(s) will be removed.\n\n"
+            f"<i>This cannot be undone.</i>",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "del_back_sessions":
+        return await _del_render_sessions(query, context, class_jobs)
+
+    if data == "del_wipe_yes":
+        view = context.user_data.get('del_view', 'all')
+        groups = _subject_groups(_jobs_for_view(class_jobs, view))
+        idx = context.user_data.get('del_sub_idx')
+        if idx is None or idx >= len(groups):
+            return await _del_render_subjects(query, context, class_jobs)
+        subject, batch, sessions = groups[idx]
+
         count = 0
-        for name in job_names:
-            jobs = context.job_queue.get_jobs_by_name(name)
-            for j in jobs:
+        for j in list(sessions):
+            try:
+                remove_job_from_db(j.name)
                 j.schedule_removal()
-            remove_job_from_db(name)
-            count += 1
+                count += 1
+            except Exception:
+                pass
 
-        audit("delete_all_classes", update.effective_user, f"{count} jobs removed")
-        await query.edit_message_text(f"🗑️ <b>DELETED {count} CLASSES!</b>", parse_mode=ParseMode.HTML)
+        audit("delete_classes", update.effective_user,
+              f"scope=subject_bulk subject={subject} batch={batch} removed={count}")
+        await query.edit_message_text(
+            f"✅ <b>DELETED {count} SESSION(S)</b>\n\n"
+            f"📖 <i>{html.escape(safe_text(subject, 'Class'))}</i>",
+            parse_mode=ParseMode.HTML
+        )
+        await asyncio.sleep(1.2)
+        context.user_data['del_sub_idx'] = None
+        return await _del_render_subjects(query, context, _collect_class_jobs(context))
+
+    # Single session tapped — confirm the scope before removing anything.
+    if data.startswith("del_j_"):
+        view = context.user_data.get('del_view', 'all')
+        groups = _subject_groups(_jobs_for_view(class_jobs, view))
+        idx = context.user_data.get('del_sub_idx')
+        try:
+            session_idx = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            return await _del_render_sessions(query, context, class_jobs)
+
+        if idx is None or idx >= len(groups):
+            return await _del_render_subjects(query, context, class_jobs)
+
+        subject, batch, sessions = groups[idx]
+        if session_idx >= len(sessions):
+            return await _del_render_sessions(query, context, class_jobs)
+
+        job = sessions[session_idx]
+        context.user_data['del_job_name'] = job.name
+
+        day_str, time_str = _session_bits(job)
+        try:
+            day_name = job.next_t.strftime('%A')
+        except Exception:
+            day_name = "Unknown"
+
+        same_day = sum(
+            1 for j in sessions
+            if j.next_t and j.next_t.strftime('%A') == day_name
+        )
+
+        kb = [
+            [InlineKeyboardButton("🎯 This session only", callback_data="del_scope_single")],
+            [InlineKeyboardButton(f"📅 All on {day_name} ({same_day})",
+                                  callback_data="del_scope_day")],
+            [InlineKeyboardButton(f"📚 All {_short_subject(subject, 14)} ({len(sessions)})",
+                                  callback_data="del_scope_subject")],
+            [InlineKeyboardButton("🔙 Back", callback_data="del_scope_cancel")],
+        ]
+
+        await query.edit_message_text(
+            f"🗑️ <b>DELETE CONFIRMATION</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📖 Subject: <b>{html.escape(safe_text(subject, 'Class'))}</b>\n"
+            f"🎯 Batch: {_batch_chip(batch)} <b>{html.escape(safe_text(batch, '—'))}</b>\n"
+            f"🗓 Session: <b>{html.escape(day_str)}</b> · ⏰ {html.escape(time_str)}\n\n"
+            f"<i>What do you want to delete?</i> 👇",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.HTML
+        )
         return
 
-    # Handle Single Delete - Show Scope Options
-    job_name = data.replace("kill_", "")
-    jobs = context.job_queue.get_jobs_by_name(job_name)
-    if not jobs:
-        await query.answer("❌ Job not found!", show_alert=True)
-        # Refresh page
-        await show_delete_page(query, context, edit=True)
-        return
-    
-    job = jobs[0]
-    data_dict = safe_job_data(job)
-    subject = data_dict.get('subject', 'Unknown')
-    batch = data_dict.get('batch', 'Unknown')
-    context.user_data['del_job_name'] = job_name
-    
-    # Safe day name
-    try:
-        day_name = job.next_t.strftime('%A')
-    except:
-        day_name = "Unknown"
-
-    kb = [
-        [InlineKeyboardButton(f"🎯 Delete This Only", callback_data="del_scope_single")],
-        [InlineKeyboardButton(f"📅 Delete All Future {subject}", callback_data="del_scope_subject")],
-        [InlineKeyboardButton("🔙 Cancel", callback_data="del_scope_cancel")]
-    ]
-    
-    await query.edit_message_text(
-        f"🗑️ <b>DELETE CONFIRMATION</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📖 Subject: <b>{subject}</b>\n"
-        f"🎯 Batch: <b>{batch}</b>\n"
-        f"📅 Day: <b>{day_name}</b>\n\n"
-        f"<i>What do you want to delete?</i> 👇",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode=ParseMode.HTML
-    )
+    return await _del_render_batches(query, context, class_jobs)
 
 async def delete_scope_handler(update, context):
     """Handle delete scope selection"""
@@ -6192,9 +6918,9 @@ async def delete_scope_handler(update, context):
     query = update.callback_query
     await query.answer()
     scope = query.data.replace("del_scope_", "")
-    
+
     if scope == "cancel":
-        await show_delete_page(query, context, edit=True)
+        await _del_render_sessions(query, context, _collect_class_jobs(context))
         return
 
     job_name = context.user_data.get('del_job_name')
@@ -6211,12 +6937,24 @@ async def delete_scope_handler(update, context):
     ref_data = safe_job_data(ref_job)
     subject = ref_data.get('subject')
     batch = ref_data.get('batch')
-    
+    try:
+        ref_day = ref_job.next_t.strftime('%A')
+    except Exception:
+        ref_day = None
+
     all_jobs = context.job_queue.jobs()
     jobs_to_kill = []
 
     if scope == "single":
         jobs_to_kill = [ref_job]
+    elif scope == "day":
+        # Same subject/batch, same weekday — the recurring slot, not the term.
+        for j in all_jobs:
+            d = safe_job_data(j)
+            j_day = j.next_t.strftime('%A') if j.next_t else None
+            if (d.get('subject') == subject and d.get('batch') == batch
+                    and ref_day and j_day == ref_day):
+                jobs_to_kill.append(j)
     elif scope == "subject":
         # Delete all future classes for this subject/batch
         for j in all_jobs:
@@ -6236,27 +6974,28 @@ async def delete_scope_handler(update, context):
           f"scope={scope} subject={subject} batch={batch} removed={count}")
 
     await query.edit_message_text(
-        f"✅ <b>DELETED {count} CLASSES!</b>\n\n"
-        f"Refreshed list below...",
+        f"✅ <b>DELETED {count} SESSION(S)</b>\n\n"
+        f"<i>Refreshing list…</i>",
         parse_mode=ParseMode.HTML
     )
-    # Rerender list after short delay
-    await asyncio.sleep(1.5)
-    
-    # Re-fetch valid jobs for pagination
-    jobs = context.job_queue.jobs()
-    valid_jobs = []
-    for j in jobs:
-        d = safe_job_data(j)
-        if j.name and d and 'batch' in d and len(f"kill_{j.name}") <= 64:
-            valid_jobs.append(j)
-    valid_jobs.sort(key=lambda j: j.next_t)
-    
-    # Update context
-    context.user_data['delete_jobs'] = [j.name for j in valid_jobs]
-    context.user_data['delete_page'] = 0
-    
-    await show_delete_page(query, context, valid_jobs, edit=True)
+    await asyncio.sleep(1.2)
+
+    remaining = _collect_class_jobs(context)
+    if not remaining:
+        await query.edit_message_text(
+            "📭 <b>NO CLASSES LEFT</b>\n\n"
+            "<i>Everything scheduled has been removed.</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    context.user_data['del_job_page'] = 0
+    if scope == "single":
+        # The subject probably still has other sessions — stay where we were.
+        await _del_render_sessions(query, context, remaining)
+    else:
+        context.user_data['del_sub_idx'] = None
+        await _del_render_subjects(query, context, remaining)
 
 
 async def handle_expired(update, context):
@@ -6863,6 +7602,9 @@ async def post_init(app):
     # Deliberately NOT advertising /login here: it takes a plaintext password and
     # must never be typed into a group.
     group_commands = [
+        # Set-the-class-topic has to be typed in the group, inside the target
+        # topic, so it is the one admin command advertised there.
+        BotCommand("classtopic", "#️⃣ Set Topic for Class Alerts (Admin)"),
         BotCommand("feedback", "💬 Send Feedback to Vasuki Bot"),
         BotCommand("updategroup", "🔄 Update Group Link (Admin)"),
     ]
@@ -6876,6 +7618,7 @@ async def post_init(app):
         BotCommand("addsubject", "➕ Add Subject"),
         BotCommand("editsubject", "✏️ Edit Subjects"),
         BotCommand("topics", "💬 View Topics"),
+        BotCommand("classtopic", "#️⃣ Class Alert Topic"),
         BotCommand("edittopic", "✏️ Edit Topic"),
         BotCommand("deletetopic", "🗑️ Delete Topic"),
         BotCommand("verifytopics", "🔄 Verify Topics"),
@@ -7595,6 +8338,8 @@ def main():
     app.add_handler(CommandHandler("attendance", attendance_command))
     app.add_handler(CommandHandler("viewattendance", attendance_command)) # Alias
     app.add_handler(CommandHandler("topic", register_topic_command))  # New topic command
+    # Works in groups (to set) and DMs (to read) — no private-only gate.
+    app.add_handler(CommandHandler("classtopic", classtopic_command))
     app.add_handler(CommandHandler("verifytopics", verify_topics_command))  # Verify topics
     app.add_handler(CallbackQueryHandler(verify_topics_callback, pattern="^verify_topics$"))
     app.add_handler(ChatMemberHandler(track_chats, ChatMemberHandler.MY_CHAT_MEMBER))
@@ -7606,8 +8351,9 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^📥 Import"), import_request))
     app.add_handler(MessageHandler(filters.Document.MimeType("application/json") & filters.ChatType.PRIVATE, handle_import_file))
     app.add_handler(MessageHandler(filters.Regex("^🗑️ Delete Class"), delete_menu))
-    app.add_handler(CallbackQueryHandler(handle_kill, pattern="^(kill_|del_page_)"))
+    # Order matters: '^del_scope_' must be tried before the broader '^del_'.
     app.add_handler(CallbackQueryHandler(delete_scope_handler, pattern="^del_scope_"))
+    app.add_handler(CallbackQueryHandler(delete_nav, pattern="^(del_|kill_)"))
     
     # NEW: Added View All Subjects Handler
     app.add_handler(MessageHandler(filters.Regex("^📚 All Subjects"), view_all_subjects))
@@ -7620,7 +8366,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^📊 Attendance"), view_attendance_stats)) 
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_photo))
     app.add_handler(MessageHandler(filters.Regex("^📅 View Schedule"), view_schedule_handler))
-    app.add_handler(CallbackQueryHandler(view_schedule_handler, pattern="^schedule_page_"))
+    app.add_handler(CallbackQueryHandler(schedule_nav, pattern="^(sch_|schedule_page_)"))
     app.add_handler(CallbackQueryHandler(mark_attendance, pattern="^att_"))
     # Preview: registered before the catch-all so it isn't treated as expired.
     app.add_handler(CommandHandler("preview", preview_command))
@@ -7650,7 +8396,11 @@ def main():
     app.add_handler(ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^✏️ Edit Class"), start_edit)],
         states={
-            EDIT_SELECT_JOB: [CallbackQueryHandler(edit_select_job, pattern="^edit_")],
+            # One router serves all three browser levels, because back-navigation
+            # moves between them in both directions.
+            EDIT_SELECT_BATCH: [CallbackQueryHandler(edit_nav, pattern="^edit_")],
+            EDIT_SELECT_SUBJECT: [CallbackQueryHandler(edit_nav, pattern="^edit_")],
+            EDIT_SELECT_JOB: [CallbackQueryHandler(edit_nav, pattern="^edit_")],
             EDIT_CHOOSE_FIELD: [CallbackQueryHandler(edit_choose_field, pattern="^field_")],
             EDIT_MSG_TYPE: [CallbackQueryHandler(edit_msg_type, pattern="^editmsg_(ai|manual|cancel)$")],
             EDIT_NEW_VALUE: [MessageHandler(txt_filter, edit_save)],
