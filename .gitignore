@@ -11,6 +11,7 @@
 # Since you are moving to Supabase, ignore local JSON DBs to avoid conflicts
 titan_db.json
 titan_backup_*.json
+vasuki_backup_*.json
 *.sqlite3
 *.db
 
