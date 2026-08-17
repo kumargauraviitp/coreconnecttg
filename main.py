@@ -1862,8 +1862,17 @@ async def updategroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     DB["config"]["group_id"] = new_id
     DB["config"]["group_name"] = chat.title
     
-    # Update all pending jobs
+    # Update all pending jobs in DB
     updated_jobs = update_all_jobs_chat_id(new_id)
+    
+    # Also update all active in-memory jobs in the job queue
+    try:
+        if context.job_queue:
+            for job in context.job_queue.jobs():
+                if hasattr(job, 'chat_id'):
+                    job.chat_id = new_id
+    except Exception as je:
+        logger.warning(f"Could not update in-memory jobs chat_id: {je}")
     
     save_db()
     
@@ -4633,6 +4642,9 @@ async def send_alert_job(context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Mark me present", callback_data=f"att_{job.name}")]])
         
         sent = False
+        target_chat_id = DB.get("config", {}).get("group_id") or job.chat_id
+        if not target_chat_id:
+            raise Exception("No target group ID configured or found on job.")
         
         # FALLBACK LEVEL 1: Try with topic + HTML
         # _resolve_thread_id applies the /classtopic default when this class has
@@ -4641,7 +4653,7 @@ async def send_alert_job(context: ContextTypes.DEFAULT_TYPE):
         # swallow an alert.
         try:
             await context.bot.send_message(
-                job.chat_id, 
+                target_chat_id, 
                 text=msg, 
                 parse_mode=ParseMode.HTML, 
                 reply_markup=kb, 
@@ -4657,7 +4669,7 @@ async def send_alert_job(context: ContextTypes.DEFAULT_TYPE):
             if "thread" in err1.lower() or "topic" in err1.lower():
                 try:
                     await context.bot.send_message(
-                        job.chat_id, 
+                        target_chat_id, 
                         text=f"⚠️ <i>Topic unavailable</i>\n\n{msg}", 
                         parse_mode=ParseMode.HTML, 
                         reply_markup=kb, 
@@ -4674,7 +4686,7 @@ async def send_alert_job(context: ContextTypes.DEFAULT_TYPE):
                 try:
                     clean_msg = re.sub(r'<[^>]+>', '', msg)
                     await context.bot.send_message(
-                        job.chat_id, 
+                        target_chat_id, 
                         text=clean_msg, 
                         reply_markup=kb, 
                         disable_web_page_preview=True,
@@ -5153,16 +5165,19 @@ async def send_custom_msg_job(context: ContextTypes.DEFAULT_TYPE):
     """Send custom scheduled message"""
     try:
         job = context.job
-        data = job.data
+        data = job.data or {}
         msg = data.get('manual_msg', '')
         link = data.get('link')
         topic_id = _resolve_thread_id(data)
+        target_chat_id = DB.get("config", {}).get("group_id") or job.chat_id
+        if not target_chat_id:
+            raise Exception("No target group ID configured or found on job.")
         
         if link and link != "None":
             msg += f"\n\n🔗 <a href='{link}'>Click Here</a>"
         
         await context.bot.send_message(
-            job.chat_id, 
+            target_chat_id, 
             text=msg, 
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=False,
