@@ -2196,6 +2196,25 @@ async def cancel_wizard(update, context):
     )
     return ConversationHandler.END
 
+def _parse_wizard_date(text: str, is_end_date: bool = False):
+    """
+    Parse a user-entered date string in IST timezone.
+    Supports 'today', 'now', or 'DD-MM-YYYY'.
+    Start dates are normalized to 00:00:00.000000 IST.
+    End dates are normalized to 23:59:59.999999 IST.
+    """
+    cleaned = text.strip().lower()
+    if cleaned in ('today', 'now'):
+        base = datetime.now(IST)
+    else:
+        naive = datetime.strptime(cleaned, "%d-%m-%Y")
+        base = IST.localize(naive)
+    
+    if is_end_date:
+        return base.replace(hour=23, minute=59, second=59, microsecond=999999)
+    else:
+        return base.replace(hour=0, minute=0, second=0, microsecond=0)
+
 async def init_schedule_wizard(update, context):
     if not await require_private_admin(update, context): return ConversationHandler.END
     if not DB["config"]["group_id"]:
@@ -2232,7 +2251,7 @@ async def init_schedule_wizard(update, context):
     return SELECT_SUB_OR_ADD
 
 async def wizard_pick_sub(update, context):
-    context.user_data['sch_sub'] = update.callback_query.data.split("_")[1]
+    context.user_data['sch_sub'] = update.callback_query.data.replace("pick_", "", 1)
     await update.callback_query.answer()
     await update.callback_query.edit_message_text(
         "📅 <b>SELECT DAYS</b>\n"
@@ -2268,21 +2287,21 @@ async def wizard_toggle_days(update, context):
 async def wizard_start_date(update, context):
     text = update.message.text.strip().lower()
     try:
-        if text == 'today': start_dt = datetime.now(IST)
-        else: start_dt = datetime.strptime(text, "%d-%m-%Y").replace(tzinfo=IST)
+        start_dt = _parse_wizard_date(text, is_end_date=False)
         context.user_data['start_dt'] = start_dt
         await update.message.reply_text(
             "🏁 <b>END DATE</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             "<i>Enter in format:</i> <code>DD-MM-YYYY</code>\n"
+            "<i>Or type:</i> <code>Today</code>\n"
             "<i>Or type:</i> <code>None</code> <i>for one-time class</i>",
             parse_mode=ParseMode.HTML
         )
         return INPUT_END_DATE
-    except:
+    except Exception:
         await update.message.reply_text(
             "❌ <b>INVALID FORMAT!</b>\n\n"
-            "<i>Please use:</i> <code>DD-MM-YYYY</code>",
+            "<i>Please use:</i> <code>DD-MM-YYYY</code> or <code>Today</code>",
             parse_mode=ParseMode.HTML
         )
         return INPUT_START_DATE
@@ -2290,8 +2309,21 @@ async def wizard_start_date(update, context):
 async def wizard_end_date(update, context):
     text = update.message.text.strip().lower()
     try:
-        if text == 'none': context.user_data['end_dt'] = None
-        else: context.user_data['end_dt'] = datetime.strptime(text, "%d-%m-%Y").replace(tzinfo=IST)
+        if text in ('none', 'skip', 'no', '-'):
+            context.user_data['end_dt'] = None
+        else:
+            end_dt = _parse_wizard_date(text, is_end_date=True)
+            start_dt = context.user_data.get('start_dt')
+            if start_dt and end_dt.date() < start_dt.date():
+                await update.message.reply_text(
+                    "❌ <b>INVALID END DATE!</b>\n\n"
+                    "<i>End date cannot be earlier than start date. Please enter again:</i>\n"
+                    "<code>DD-MM-YYYY</code>, <code>Today</code>, or <code>None</code>",
+                    parse_mode=ParseMode.HTML
+                )
+                return INPUT_END_DATE
+            context.user_data['end_dt'] = end_dt
+
         await update.message.reply_text(
             "⏰ <b>CLASS START TIME</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2300,10 +2332,10 @@ async def wizard_end_date(update, context):
             parse_mode=ParseMode.HTML
         )
         return INPUT_TIME
-    except:
+    except Exception:
         await update.message.reply_text(
             "❌ <b>INVALID FORMAT!</b>\n\n"
-            "<i>Please use:</i> <code>DD-MM-YYYY</code>",
+            "<i>Please use:</i> <code>DD-MM-YYYY</code>, <code>Today</code>, or <code>None</code>",
             parse_mode=ParseMode.HTML
         )
         return INPUT_END_DATE
@@ -2378,43 +2410,45 @@ async def wizard_end_time(update, context):
     return INPUT_LINK
 
 async def wizard_link(update, context):
-    context.user_data['sch_link'] = update.message.text
+    context.user_data['sch_link'] = update.message.text.strip()
     
-    # Check for topics
-    topics = DB.get("topics", {})
+    # Always present topic selection
+    topics = DB.get("topics", {}) if isinstance(DB.get("topics"), dict) else {}
     default_tid, default_name = get_class_topic()
 
+    kb = []
+    if default_tid:
+        kb.append([InlineKeyboardButton(
+            f"⭐ Use Default ({default_name})", callback_data="topic_default")])
+    
     if topics:
-        kb = []
-        # The default set by /classtopic goes first, so the common case is one
-        # tap and per-class overrides stay available underneath.
-        if default_tid:
-            kb.append([InlineKeyboardButton(
-                f"⭐ Use Default ({default_name})", callback_data="topic_default")])
         row = []
         for tid, name in topics.items():
             row.append(InlineKeyboardButton(name, callback_data=f"topic_{tid}"))
             if len(row) == 2:
                 kb.append(row)
                 row = []
-        if row: kb.append(row)
-        kb.append([InlineKeyboardButton("📢 General (No Topic)", callback_data="topic_general")])
+        if row:
+            kb.append(row)
+    
+    kb.append([
+        InlineKeyboardButton("📢 General (No Topic)", callback_data="topic_general"),
+        InlineKeyboardButton("✏️ Custom Topic ID", callback_data="topic_custom")
+    ])
 
-        hint = (f"<i>Default is</i> <b>{html.escape(str(default_name))}</b>"
-                f" <i>(set with /classtopic).</i>\n\n" if default_tid else "")
-        await update.message.reply_text(
-            "💬 <b>SELECT TOPIC</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{hint}"
-            "<i>Select the topic where this class notification should be posted:</i>",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode=ParseMode.HTML
-        )
-        return SELECT_TOPIC
-    else:
-        # No topics registered — inherit whatever /classtopic points at.
-        context.user_data['sch_topic_id'] = None
-        return await show_offset_selection(update)
+    hint = (f"<i>Default is</i> <b>{html.escape(str(default_name))}</b>"
+            f" <i>(set with /classtopic).</i>\n\n" if default_tid else "")
+    
+    await update.message.reply_text(
+        "💬 <b>SELECT TOPIC</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{hint}"
+        "<i>Select a topic or choose an option below:</i>\n"
+        "<i>(You can also type a Topic ID directly)</i>",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode=ParseMode.HTML
+    )
+    return SELECT_TOPIC
 
 async def wizard_topic_selection(update, context):
     query = update.callback_query
@@ -2422,19 +2456,44 @@ async def wizard_topic_selection(update, context):
     data = query.data
 
     if data == "topic_default":
-        # None means "inherit", so the class follows /classtopic even if it
-        # changes later.
+        # None means "inherit", so the class follows /classtopic even if it changes later.
         context.user_data['sch_topic_id'] = None
+        return await show_offset_selection(update)
     elif data == "topic_general":
         context.user_data['sch_topic_id'] = GENERAL_TOPIC
+        return await show_offset_selection(update)
+    elif data == "topic_custom":
+        await query.edit_message_text(
+            "🆔 <b>ENTER TOPIC ID</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "<i>Type the Message Thread ID (numbers only):</i>\n"
+            "<i>Example:</i> <code>1234</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return SELECT_TOPIC
     else:
         tid = data.replace("topic_", "")
         try:
             context.user_data['sch_topic_id'] = int(tid)
         except ValueError:
             context.user_data['sch_topic_id'] = None
+        return await show_offset_selection(update)
 
-    return await show_offset_selection(update)
+async def wizard_topic_text_input(update, context):
+    text = update.message.text.strip()
+    if text.isdigit():
+        context.user_data['sch_topic_id'] = int(text)
+        return await show_offset_selection(update)
+    elif text.lower() in ('general', 'none', 'no', '0'):
+        context.user_data['sch_topic_id'] = GENERAL_TOPIC
+        return await show_offset_selection(update)
+    else:
+        await update.message.reply_text(
+            "❌ <b>INVALID TOPIC ID!</b>\n\n"
+            "<i>Please enter numbers only (e.g. <code>1234</code>) or type <code>General</code>:</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return SELECT_TOPIC
 
 async def show_offset_selection(update):
     kb = [
@@ -2526,8 +2585,8 @@ async def wizard_custom_offset(update, context):
         return CUSTOM_OFFSET_INPUT
 
 async def wizard_msg_choice(update, context):
+    await update.callback_query.answer()
     if update.callback_query.data == "msg_manual":
-        await update.callback_query.answer()
         await update.callback_query.edit_message_text(
             "✍️ <b>CUSTOM MESSAGE</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2548,37 +2607,59 @@ async def wizard_finalize(update_obj, context):
     batch, sub, days = d['sch_batch'], d['sch_sub'], d['sch_days']
     start_dt, end_dt = d['start_dt'], d['end_dt']
     t_str = d['sch_time']
-    try: h, m = map(int, t_str.split(':'))
-    except: return ConversationHandler.END
+    try:
+        h, m = map(int, t_str.split(':'))
+    except Exception:
+        return ConversationHandler.END
 
-    day_map = {"Mon":0, "Tue":1, "Wed":2, "Thu":3, "Fri":4, "Sat":5, "Sun":6}
+    day_map = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
     target_weekdays = [day_map[day] for day in days]
     dates = []
-    
+    now = datetime.now(IST)
+    offset_mins = int(d.get('sch_offset', 0))
+
     if end_dt:
         curr = start_dt
-        while curr <= end_dt:
-            if curr.weekday() in target_weekdays: dates.append(curr)
+        while curr.date() <= end_dt.date():
+            if curr.weekday() in target_weekdays:
+                run_dt = curr.replace(hour=h, minute=m, second=0, microsecond=0)
+                notify_dt = run_dt - timedelta(minutes=offset_mins)
+                if notify_dt > now:
+                    dates.append(curr)
             curr += timedelta(days=1)
     else:
         for wd in target_weekdays:
             curr = start_dt
             delta = wd - curr.weekday()
-            if delta < 0: delta += 7
-            dates.append(curr + timedelta(days=delta))
+            if delta < 0:
+                delta += 7
+            target_date = curr + timedelta(days=delta)
+            run_dt = target_date.replace(hour=h, minute=m, second=0, microsecond=0)
+            notify_dt = run_dt - timedelta(minutes=offset_mins)
+            if notify_dt <= now and delta == 0:
+                target_date += timedelta(days=7)
+            dates.append(target_date)
 
     count = 0
     gid = DB["config"]["group_id"]
-    if not gid: return ConversationHandler.END
+    if not gid:
+        return ConversationHandler.END
 
+    base_time_ts = int(time.time())
     for dt in dates:
-        run_dt = dt.replace(hour=h, minute=m, second=0)
-        notify_dt = run_dt - timedelta(minutes=d['sch_offset'])
-        job_id = f"{batch}_{int(time.time())}_{count}"
+        run_dt = dt.replace(hour=h, minute=m, second=0, microsecond=0)
+        notify_dt = run_dt - timedelta(minutes=offset_mins)
+        if notify_dt <= now:
+            continue
+        
+        job_id = f"{batch}_{base_time_ts}_{count}"
         display_time_str = d.get('sch_time_display', t_str)
         job_data = {
-            "batch": batch, "subject": sub, "time_display": display_time_str, 
-            "link": d['sch_link'], "manual_msg": d.get('sch_manual_msg'),
+            "batch": batch,
+            "subject": sub,
+            "time_display": display_time_str, 
+            "link": d['sch_link'],
+            "manual_msg": d.get('sch_manual_msg'),
             "msg_type": "MANUAL" if d.get('sch_manual_msg') else "AI",
             "message_thread_id": d.get('sch_topic_id')
         }
@@ -2586,21 +2667,36 @@ async def wizard_finalize(update_obj, context):
         add_job_to_db(job_id, notify_dt.timestamp(), gid, job_data)
         count += 1
     
+    save_db()
+
     topic_name = _topic_label(d.get('sch_topic_id'))
     time_summary = _format_time_12h(d.get('sch_time_display', t_str))
     
-    msg = (
-        f"✅ <b>SCHEDULED SUCCESSFULLY</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<b>{count} class(es) added to schedule.</b>\n\n"
-        f"📌 <i>Subject:</i> <b>{sub}</b>\n"
-        f"🎯 <i>Batch:</i> <b>{batch}</b>\n"
-        f"💬 <i>Topic:</i> <b>{topic_name}</b>\n"
-        f"⏰ <i>Time:</i> <b>{time_summary}</b>\n\n"
-        f"<i>Notifications will be dispatched automatically.</i>"
-    )
-    if isinstance(update_obj, Update): await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
-    else: await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    if count == 0:
+        msg = (
+            f"⚠️ <b>NO CLASSES SCHEDULED</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<i>The specified class time has already passed for the selected date(s).</i>\n\n"
+            f"📌 <i>Subject:</i> <b>{sub}</b>\n"
+            f"🎯 <i>Batch:</i> <b>{batch}</b>\n"
+            f"⏰ <i>Time:</i> <b>{time_summary}</b>"
+        )
+    else:
+        msg = (
+            f"✅ <b>SCHEDULED SUCCESSFULLY</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<b>{count} class(es) added to schedule.</b>\n\n"
+            f"📌 <i>Subject:</i> <b>{sub}</b>\n"
+            f"🎯 <i>Batch:</i> <b>{batch}</b>\n"
+            f"💬 <i>Topic:</i> <b>{topic_name}</b>\n"
+            f"⏰ <i>Time:</i> <b>{time_summary}</b>\n\n"
+            f"<i>Notifications will be dispatched automatically.</i>"
+        )
+    
+    if hasattr(update_obj, 'message') and update_obj.message:
+        await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    elif hasattr(update_obj, 'reply_text'):
+        await update_obj.reply_text(msg, parse_mode=ParseMode.HTML)
     return ConversationHandler.END
 
 # ==============================================================================
@@ -2663,38 +2759,59 @@ async def combined_wizard_finalize(update_obj, context):
     sub, days = d['sch_sub'], d['sch_days']
     start_dt, end_dt = d['start_dt'], d['end_dt']
     t_str = d['sch_time']
-    try: h, m = map(int, t_str.split(':'))
-    except: return ConversationHandler.END
+    try:
+        h, m = map(int, t_str.split(':'))
+    except Exception:
+        return ConversationHandler.END
 
-    day_map = {"Mon":0, "Tue":1, "Wed":2, "Thu":3, "Fri":4, "Sat":5, "Sun":6}
+    day_map = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
     target_weekdays = [day_map[day] for day in days]
     dates = []
-    
+    now = datetime.now(IST)
+    offset_mins = int(d.get('sch_offset', 0))
+
     if end_dt:
         curr = start_dt
-        while curr <= end_dt:
-            if curr.weekday() in target_weekdays: dates.append(curr)
+        while curr.date() <= end_dt.date():
+            if curr.weekday() in target_weekdays:
+                run_dt = curr.replace(hour=h, minute=m, second=0, microsecond=0)
+                notify_dt = run_dt - timedelta(minutes=offset_mins)
+                if notify_dt > now:
+                    dates.append(curr)
             curr += timedelta(days=1)
     else:
         for wd in target_weekdays:
             curr = start_dt
             delta = wd - curr.weekday()
-            if delta < 0: delta += 7
-            dates.append(curr + timedelta(days=delta))
+            if delta < 0:
+                delta += 7
+            target_date = curr + timedelta(days=delta)
+            run_dt = target_date.replace(hour=h, minute=m, second=0, microsecond=0)
+            notify_dt = run_dt - timedelta(minutes=offset_mins)
+            if notify_dt <= now and delta == 0:
+                target_date += timedelta(days=7)
+            dates.append(target_date)
 
     count = 0
     gid = DB["config"]["group_id"]
-    if not gid: return ConversationHandler.END
+    if not gid:
+        return ConversationHandler.END
 
-    # Schedule a SINGLE message for BOTH batches
+    base_time_ts = int(time.time())
     for dt in dates:
-        run_dt = dt.replace(hour=h, minute=m, second=0)
-        notify_dt = run_dt - timedelta(minutes=d['sch_offset'])
-        job_id = f"COMBINED_{int(time.time())}_{count}"
+        run_dt = dt.replace(hour=h, minute=m, second=0, microsecond=0)
+        notify_dt = run_dt - timedelta(minutes=offset_mins)
+        if notify_dt <= now:
+            continue
+        
+        job_id = f"COMBINED_{base_time_ts}_{count}"
         display_time_str = d.get('sch_time_display', t_str)
         job_data = {
-            "batch": "CSDA & AICS", "subject": sub, "time_display": display_time_str, 
-            "link": d['sch_link'], "manual_msg": d.get('sch_manual_msg'),
+            "batch": "CSDA & AICS",
+            "subject": sub,
+            "time_display": display_time_str, 
+            "link": d['sch_link'],
+            "manual_msg": d.get('sch_manual_msg'),
             "msg_type": "MANUAL" if d.get('sch_manual_msg') else "AI",
             "message_thread_id": d.get('sch_topic_id')
         }
@@ -2702,27 +2819,42 @@ async def combined_wizard_finalize(update_obj, context):
         add_job_to_db(job_id, notify_dt.timestamp(), gid, job_data)
         count += 1
     
+    save_db()
+
     topic_name = _topic_label(d.get('sch_topic_id'))
     time_summary = _format_time_12h(d.get('sch_time_display', t_str))
     
-    msg = (
-        f"✅ <b>SCHEDULED SUCCESSFULLY</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<b>{count} class(es) added to schedule.</b>\n\n"
-        f"📌 <i>Subject:</i> <b>{sub}</b>\n"
-        f"🎯 <i>Batch:</i> <b>CSDA + AICS</b>\n"
-        f"💬 <i>Topic:</i> <b>{topic_name}</b>\n"
-        f"⏰ <i>Time:</i> <b>{time_summary}</b>\n\n"
-        f"<i>Notifications will be dispatched to both batches.</i>"
-    )
-    if isinstance(update_obj, Update): await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
-    else: await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    if count == 0:
+        msg = (
+            f"⚠️ <b>NO CLASSES SCHEDULED</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<i>The specified class time has already passed for the selected date(s).</i>\n\n"
+            f"📌 <i>Subject:</i> <b>{sub}</b>\n"
+            f"🎯 <i>Batch:</i> <b>CSDA + AICS</b>\n"
+            f"⏰ <i>Time:</i> <b>{time_summary}</b>"
+        )
+    else:
+        msg = (
+            f"✅ <b>SCHEDULED SUCCESSFULLY</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"<b>{count} class(es) added to schedule.</b>\n\n"
+            f"📌 <i>Subject:</i> <b>{sub}</b>\n"
+            f"🎯 <i>Batch:</i> <b>CSDA + AICS</b>\n"
+            f"💬 <i>Topic:</i> <b>{topic_name}</b>\n"
+            f"⏰ <i>Time:</i> <b>{time_summary}</b>\n\n"
+            f"<i>Notifications will be dispatched to both batches.</i>"
+        )
+    
+    if hasattr(update_obj, 'message') and update_obj.message:
+        await update_obj.message.reply_text(msg, parse_mode=ParseMode.HTML)
+    elif hasattr(update_obj, 'reply_text'):
+        await update_obj.reply_text(msg, parse_mode=ParseMode.HTML)
     return ConversationHandler.END
 
 async def combined_wizard_msg_choice(update, context):
     """Handle message type choice for combined wizard"""
+    await update.callback_query.answer()
     if update.callback_query.data == "msg_manual":
-        await update.callback_query.answer()
         await update.callback_query.edit_message_text(
             "✍️ <b>CUSTOM MESSAGE</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -4471,7 +4603,8 @@ async def send_alert_job(context: ContextTypes.DEFAULT_TYPE):
     """
     import random
     job = context.job
-    data = job.data
+    data = job.data or {}
+    logger.info(f"⏰ TRIGGERING JOB: {job.name} at {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')} | Subject: {data.get('subject')} | Batch: {data.get('batch')}")
     max_retries = 4  # Increased retries
     retry_count = data.get('retry_count', 0)
     
@@ -4593,14 +4726,33 @@ async def restore_jobs(application: Application):
     
     for job_entry in jobs_to_restore:
         try:
-            if job_entry["timestamp"] < now_ts:
-                remove_job_from_db(job_entry["name"])
+            ts = float(job_entry["timestamp"])
+            name = job_entry["name"]
+            data = job_entry.get("data", {})
+            if ts < now_ts:
+                logger.info(f"🗑️ Removing expired job on boot: {name} (was scheduled for {datetime.fromtimestamp(ts, IST).strftime('%Y-%m-%d %H:%M:%S IST')})")
+                remove_job_from_db(name)
                 continue
-            run_dt = datetime.fromtimestamp(job_entry["timestamp"], IST)
-            application.job_queue.run_once(send_alert_job, run_dt, chat_id=job_entry["chat_id"], name=job_entry["name"], data=job_entry["data"])
+            
+            run_dt = datetime.fromtimestamp(ts, IST)
+            callback_func = send_custom_msg_job if (name.startswith("cmsg_") or data.get("msg_type") == "custom") else send_alert_job
+            application.job_queue.run_once(
+                callback_func,
+                run_dt,
+                chat_id=job_entry["chat_id"],
+                name=name,
+                data=data
+            )
             count += 1
-        except Exception: continue
-    if count > 0: logger.info(f"♻️ RESTORED {count} JOBS")
+            logger.info(f"📌 Restored scheduled job: {name} for {run_dt.strftime('%Y-%m-%d %H:%M:%S IST')}")
+        except Exception as e:
+            logger.error(f"Failed to restore job {job_entry.get('name')}: {e}")
+            continue
+            
+    if count > 0:
+        logger.info(f"♻️ RESTORED {count} JOBS from database")
+    else:
+        logger.info("ℹ️ No pending future jobs to restore from database")
 
 # ==============================================================================
 # 📝 CUSTOM MESSAGE SCHEDULER
@@ -4725,49 +4877,43 @@ async def cmsg_start_date(update, context):
     """Handle start date input"""
     try:
         text = update.message.text.strip().lower()
-        if text == 'today':
-            start_dt = datetime.now(IST).replace(hour=0, minute=0, second=0)
-        else:
-            try:
-                start_dt = datetime.strptime(text, "%d-%m-%Y").replace(tzinfo=IST)
-            except:
-                await update.message.reply_text(
-                    "❌ <b>INVALID FORMAT!</b>\n\n"
-                    "<i>Use:</i> <code>DD-MM-YYYY</code>",
-                    parse_mode=ParseMode.HTML
-                )
-                return CUSTOM_MSG_START
-        
+        start_dt = _parse_wizard_date(text, is_end_date=False)
         context.user_data['cmsg_start'] = start_dt
         await update.message.reply_text(
             "📅 <b>END DATE (Optional)</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             "<i>Enter in format:</i> <code>DD-MM-YYYY</code>\n"
+            "<i>Or type:</i> <code>Today</code>\n"
             "<i>Or type:</i> <code>None</code> <i>for one-time message</i>",
             parse_mode=ParseMode.HTML
         )
         return CUSTOM_MSG_END
-    except Exception as e:
-        logger.error(f"Error in cmsg_start_date: {e}")
-        return ConversationHandler.END
+    except Exception:
+        await update.message.reply_text(
+            "❌ <b>INVALID FORMAT!</b>\n\n"
+            "<i>Use:</i> <code>DD-MM-YYYY</code> or <code>Today</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return CUSTOM_MSG_START
 
 async def cmsg_end_date(update, context):
     """Handle end date input"""
     try:
         text = update.message.text.strip().lower()
-        if text == 'none':
+        if text in ('none', 'skip', 'no', '-'):
             context.user_data['cmsg_end'] = None
         else:
-            try:
-                end_dt = datetime.strptime(text, "%d-%m-%Y").replace(tzinfo=IST)
-                context.user_data['cmsg_end'] = end_dt
-            except:
+            end_dt = _parse_wizard_date(text, is_end_date=True)
+            start_dt = context.user_data.get('cmsg_start')
+            if start_dt and end_dt.date() < start_dt.date():
                 await update.message.reply_text(
-                    "❌ <b>INVALID FORMAT!</b>\n\n"
-                    "<i>Use:</i> <code>DD-MM-YYYY</code> or <code>None</code>",
+                    "❌ <b>INVALID END DATE!</b>\n\n"
+                    "<i>End date cannot be earlier than start date. Please enter again:</i>\n"
+                    "<code>DD-MM-YYYY</code>, <code>Today</code>, or <code>None</code>",
                     parse_mode=ParseMode.HTML
                 )
                 return CUSTOM_MSG_END
+            context.user_data['cmsg_end'] = end_dt
         
         await update.message.reply_text(
             "⏰ <b>SCHEDULE TIME</b>\n"
@@ -4777,9 +4923,13 @@ async def cmsg_end_date(update, context):
             parse_mode=ParseMode.HTML
         )
         return CUSTOM_MSG_TIME
-    except Exception as e:
-        logger.error(f"Error in cmsg_end_date: {e}")
-        return ConversationHandler.END
+    except Exception:
+        await update.message.reply_text(
+            "❌ <b>INVALID FORMAT!</b>\n\n"
+            "<i>Use:</i> <code>DD-MM-YYYY</code>, <code>Today</code>, or <code>None</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return CUSTOM_MSG_END
 
 async def cmsg_text_input(update, context):
     """Handle message text input"""
@@ -4811,35 +4961,39 @@ async def cmsg_link_input(update, context):
         else:
             context.user_data['cmsg_link'] = update.message.text.strip()
         
-        # Check for topics
-        topics = DB.get("topics", {})
+        # Always present topic selection
+        topics = DB.get("topics", {}) if isinstance(DB.get("topics"), dict) else {}
         default_tid, default_name = get_class_topic()
+        
+        kb = []
+        if default_tid:
+            kb.append([InlineKeyboardButton(
+                f"⭐ Use Default ({default_name})", callback_data="ctopic_default")])
         if topics:
-            kb = []
-            if default_tid:
-                kb.append([InlineKeyboardButton(
-                    f"⭐ Use Default ({default_name})", callback_data="ctopic_default")])
             row = []
             for tid, name in topics.items():
                 row.append(InlineKeyboardButton(name, callback_data=f"ctopic_{tid}"))
                 if len(row) == 2:
                     kb.append(row)
                     row = []
-            if row: kb.append(row)
-            kb.append([InlineKeyboardButton("📢 General (No Topic)", callback_data="ctopic_general")])
-            
-            msg_obj = update.callback_query.message if update.callback_query else update.message
-            await msg_obj.reply_text(
-                "💬 <b>SELECT TOPIC</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                "<i>Where should this announcement go?</i> 👇",
-                reply_markup=InlineKeyboardMarkup(kb),
-                parse_mode=ParseMode.HTML
-            )
-            return SELECT_TOPIC
-        else:
-            context.user_data['cmsg_topic_id'] = None
-            return await cmsg_finalize(update, context)
+            if row:
+                kb.append(row)
+        
+        kb.append([
+            InlineKeyboardButton("📢 General (No Topic)", callback_data="ctopic_general"),
+            InlineKeyboardButton("✏️ Custom Topic ID", callback_data="ctopic_custom")
+        ])
+        
+        msg_obj = update.callback_query.message if update.callback_query else update.message
+        await msg_obj.reply_text(
+            "💬 <b>SELECT TOPIC</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "<i>Where should this announcement go?</i> 👇\n"
+            "<i>(You can also type a Topic ID directly)</i>",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode=ParseMode.HTML
+        )
+        return SELECT_TOPIC
             
     except Exception as e:
         logger.error(f"Error in cmsg_link_input: {e}")
@@ -4854,19 +5008,46 @@ async def cmsg_topic_selection(update, context):
         
         if data == "ctopic_default":
             context.user_data['cmsg_topic_id'] = None
+            return await cmsg_finalize(update, context)
         elif data == "ctopic_general":
             context.user_data['cmsg_topic_id'] = GENERAL_TOPIC
+            return await cmsg_finalize(update, context)
+        elif data == "ctopic_custom":
+            await query.edit_message_text(
+                "🆔 <b>ENTER TOPIC ID</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "<i>Type the Message Thread ID (numbers only):</i>\n"
+                "<i>Example:</i> <code>1234</code>",
+                parse_mode=ParseMode.HTML
+            )
+            return SELECT_TOPIC
         else:
             tid = data.replace("ctopic_", "")
             try:
                 context.user_data['cmsg_topic_id'] = int(tid)
             except ValueError:
                 context.user_data['cmsg_topic_id'] = None
-
-        return await cmsg_finalize(update, context)
+            return await cmsg_finalize(update, context)
     except Exception as e:
         logger.error(f"Error in cmsg_topic_selection: {e}")
         return ConversationHandler.END
+
+async def cmsg_topic_text_input(update, context):
+    """Handle text topic ID input for custom message"""
+    text = update.message.text.strip()
+    if text.isdigit():
+        context.user_data['cmsg_topic_id'] = int(text)
+        return await cmsg_finalize(update, context)
+    elif text.lower() in ('general', 'none', 'no', '0'):
+        context.user_data['cmsg_topic_id'] = GENERAL_TOPIC
+        return await cmsg_finalize(update, context)
+    else:
+        await update.message.reply_text(
+            "❌ <b>INVALID TOPIC ID!</b>\n\n"
+            "<i>Please enter numbers only (e.g. <code>1234</code>) or type <code>General</code>:</i>",
+            parse_mode=ParseMode.HTML
+        )
+        return SELECT_TOPIC
 
 async def cmsg_finalize(update, context):
     """Finalize and schedule custom message"""
@@ -4883,40 +5064,41 @@ async def cmsg_finalize(update, context):
         h, m = map(int, time_str.split(':'))
         gid = DB["config"]["group_id"]
         
-        # Determine days to schedule
-        # Determine days to schedule
         selected_days = d.get('cmsg_days', [])
         day_map = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4, "Sat": 5, "Sun": 6}
         target_weekdays = [day_map[day] for day in selected_days]
         days = []
+        now = datetime.now(IST)
 
         if end_dt:
             current = start_dt
-            while current <= end_dt:
+            while current.date() <= end_dt.date():
                 if current.weekday() in target_weekdays:
-                    days.append(current)
+                    run_dt = current.replace(hour=h, minute=m, second=0, microsecond=0)
+                    if run_dt > now:
+                        days.append(current)
                 current += timedelta(days=1)
         else:
-            # If no end date, find the next occurrence for EACH selected day
             for target_wd in target_weekdays:
                 current = start_dt
-                # Calculate days until next target weekday
                 days_ahead = target_wd - current.weekday()
                 if days_ahead < 0:
                     days_ahead += 7
                 next_date = current + timedelta(days=days_ahead)
+                run_dt = next_date.replace(hour=h, minute=m, second=0, microsecond=0)
+                if run_dt <= now and days_ahead == 0:
+                    next_date += timedelta(days=7)
                 days.append(next_date)
-            
-            # Sort days just in case
             days.sort()
         
         count = 0
+        base_time_ts = int(time.time())
         for day in days:
-            run_dt = day.replace(hour=h, minute=m, second=0)
-            if run_dt < datetime.now(IST):
+            run_dt = day.replace(hour=h, minute=m, second=0, microsecond=0)
+            if run_dt <= now:
                 continue
             
-            job_id = f"cmsg_{batch}_{int(time.time())}_{count}"
+            job_id = f"cmsg_{batch}_{base_time_ts}_{count}"
             job_data = {
                 "batch": batch,
                 "subject": "Custom",
@@ -4938,16 +5120,26 @@ async def cmsg_finalize(update, context):
         
         topic_name = _topic_label(topic_id)
         
-        await reply_func(
-            f"✅ <b>CUSTOM MESSAGE SCHEDULED</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📢 <b>Batch:</b> {batch}\n"
-            f"💬 <b>Topic:</b> {topic_name}\n"
-            f"⏰ <b>Time:</b> {time_str}\n"
-            f"📅 <b>Messages queued:</b> {count}\n\n"
-            f"<i>The announcement will be dispatched at the scheduled time.</i>",
-            parse_mode=ParseMode.HTML
-        )
+        if count == 0:
+            await reply_func(
+                f"⚠️ <b>NO MESSAGES SCHEDULED</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"<i>The specified time ({time_str}) has already passed for the selected date(s).</i>\n\n"
+                f"📢 <b>Batch:</b> {batch}\n"
+                f"💬 <b>Topic:</b> {topic_name}",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await reply_func(
+                f"✅ <b>CUSTOM MESSAGE SCHEDULED</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📢 <b>Batch:</b> {batch}\n"
+                f"💬 <b>Topic:</b> {topic_name}\n"
+                f"⏰ <b>Time:</b> {time_str}\n"
+                f"📅 <b>Messages queued:</b> {count}\n\n"
+                f"<i>The announcement will be dispatched at the scheduled time.</i>",
+                parse_mode=ParseMode.HTML
+            )
         return ConversationHandler.END
     except Exception as e:
         logger.error(f"Error in cmsg_finalize: {e}")
@@ -5774,19 +5966,24 @@ async def handle_import_file(update, context):
         now_ts = datetime.now(IST).timestamp()
         for job_entry in DB.get("active_jobs", []):
             try:
-                if job_entry["timestamp"] < now_ts:
+                ts = float(job_entry.get("timestamp", 0))
+                name = job_entry.get("name", "")
+                data = job_entry.get("data", {})
+                if ts < now_ts:
                     continue  # Skip expired jobs
-                run_dt = datetime.fromtimestamp(job_entry["timestamp"], IST)
+                run_dt = datetime.fromtimestamp(ts, IST)
+                callback_func = send_custom_msg_job if (name.startswith("cmsg_") or data.get("msg_type") == "custom") else send_alert_job
                 context.job_queue.run_once(
-                    send_alert_job, 
+                    callback_func, 
                     run_dt, 
                     chat_id=job_entry["chat_id"], 
-                    name=job_entry["name"], 
-                    data=job_entry["data"]
+                    name=name, 
+                    data=data
                 )
                 restored += 1
+                logger.info(f"📌 Restored imported job: {name} for {run_dt.strftime('%Y-%m-%d %H:%M:%S IST')}")
             except Exception as e:
-                logger.error(f"Failed to restore job: {e}")
+                logger.error(f"Failed to restore imported job {job_entry.get('name')}: {e}")
                 continue
 
         if ignored or redirected:
@@ -8430,7 +8627,10 @@ def main():
             INPUT_TIME: [MessageHandler(txt_filter, wizard_time)],
             INPUT_END_TIME: [MessageHandler(txt_filter, wizard_end_time)],
             INPUT_LINK: [MessageHandler(txt_filter, wizard_link)],
-            SELECT_TOPIC: [CallbackQueryHandler(wizard_topic_selection, pattern="^topic_")],
+            SELECT_TOPIC: [
+                CallbackQueryHandler(wizard_topic_selection, pattern="^topic_"),
+                MessageHandler(txt_filter, wizard_topic_text_input)
+            ],
             SELECT_OFFSET: [CallbackQueryHandler(wizard_offset, pattern="^offset_")],
             CUSTOM_OFFSET_INPUT: [MessageHandler(txt_filter, wizard_custom_offset)],
             MSG_TYPE_CHOICE: [CallbackQueryHandler(wizard_msg_choice, pattern="^msg_")],
@@ -8451,7 +8651,10 @@ def main():
             INPUT_TIME: [MessageHandler(txt_filter, wizard_time)],
             INPUT_END_TIME: [MessageHandler(txt_filter, wizard_end_time)],
             INPUT_LINK: [MessageHandler(txt_filter, wizard_link)],
-            SELECT_TOPIC: [CallbackQueryHandler(wizard_topic_selection, pattern="^topic_")],
+            SELECT_TOPIC: [
+                CallbackQueryHandler(wizard_topic_selection, pattern="^topic_"),
+                MessageHandler(txt_filter, wizard_topic_text_input)
+            ],
             SELECT_OFFSET: [CallbackQueryHandler(wizard_offset, pattern="^offset_")],
             CUSTOM_OFFSET_INPUT: [MessageHandler(txt_filter, wizard_custom_offset)],
             MSG_TYPE_CHOICE: [CallbackQueryHandler(combined_wizard_msg_choice, pattern="^msg_")],
@@ -8475,7 +8678,10 @@ def main():
                 MessageHandler(txt_filter, cmsg_link_input),
                 CallbackQueryHandler(cmsg_link_input, pattern="^cmsg_link_skip")
             ],
-            SELECT_TOPIC: [CallbackQueryHandler(cmsg_topic_selection, pattern="^ctopic_")]
+            SELECT_TOPIC: [
+                CallbackQueryHandler(cmsg_topic_selection, pattern="^ctopic_"),
+                MessageHandler(txt_filter, cmsg_topic_text_input)
+            ]
         },
         fallbacks=[MessageHandler(filters.Regex(MENU_REGEX), cancel_wizard)],
         conversation_timeout=300
