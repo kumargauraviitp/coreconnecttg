@@ -6625,7 +6625,7 @@ async def handle_photo(update, context):
             # Schedule for multiple weeks
             for week in range(weeks_to_schedule):
                 run = now + timedelta(days=delta + (week * 7))
-                run = run.replace(hour=h, minute=m, second=0)
+                run = run.replace(hour=h, minute=m, second=0, microsecond=0)
                 
                 # Batch text comes straight from the vision model, so it can
                 # contain spaces or punctuation — normalise before it becomes
