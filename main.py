@@ -74,8 +74,8 @@ from telegram.ext import (
     filters,
     JobQueue
 )
-from telegram.request import HTTPXRequest 
-from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
+from telegram.request import HTTPXRequest
+from telegram.error import BadRequest, Conflict, NetworkError, RetryAfter, TimedOut
 
 # SUPABASE CLIENT
 from supabase import create_client, Client
