@@ -300,41 +300,6 @@ def _ensure_db_shape():
     DB["system_stats"].setdefault("start_time", time.time())
     DB["system_stats"].setdefault("classes_scheduled", 0)
     DB["system_stats"].setdefault("ai_requests", 0)
-    _realign_lmt_timestamps()
-
-
-def _realign_lmt_timestamps():
-    """
-    Auto-detect and fix legacy jobs imported with the 23-minute pytz LMT offset bug
-    (e.g., jobs where alert was scheduled 38m before class instead of 15m, 33m instead of 10m, etc.)
-    """
-    if not isinstance(DB.get("active_jobs"), list):
-        return
-    updated = 0
-    for job in DB["active_jobs"]:
-        try:
-            ts = float(job.get("timestamp", 0))
-            dt = datetime.fromtimestamp(ts, IST)
-            jdata = job.get("data", {})
-            t_disp = jdata.get("time_display", "")
-            if not t_disp:
-                continue
-            start_str = t_disp.split("-")[0].strip() if "-" in t_disp else t_disp.strip()
-            parts = start_str.split(":")
-            if len(parts) != 2:
-                continue
-            h, m = int(parts[0]), int(parts[1])
-            class_dt = IST.localize(datetime(dt.year, dt.month, dt.day, h, m, 0))
-            diff_mins = round((class_dt - dt).total_seconds() / 60.0)
-            if diff_mins in (38, 33, 28, 23):
-                intended_offset = diff_mins - 23
-                new_notify_dt = class_dt - timedelta(minutes=intended_offset)
-                job["timestamp"] = new_notify_dt.timestamp()
-                updated += 1
-        except Exception:
-            continue
-    if updated > 0:
-        logger.info(f"⏰ Auto-corrected {updated} legacy jobs affected by 23-minute LMT shift.")
 
 
 def load_db():
