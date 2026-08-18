@@ -7713,7 +7713,13 @@ BENIGN_ERRORS = (Conflict, TimedOut, RetryAfter)
 
 
 def _is_benign_error(err):
-    return isinstance(err, BENIGN_ERRORS) or type(err) is NetworkError
+    if isinstance(err, BENIGN_ERRORS) or type(err) is NetworkError:
+        return True
+    if isinstance(err, BadRequest):
+        msg = str(err).lower()
+        if "message is not modified" in msg or "query is too old" in msg:
+            return True
+    return False
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
